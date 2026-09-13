@@ -1,0 +1,996 @@
+<Window x:Class="LastRegret.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:LastRegret.App"
+        Title="回溯"
+          Icon="app.ico"
+        Width="780" Height="520"
+        MinWidth="600" MinHeight="380"
+        Background="{StaticResource BgWindow}"
+        WindowStartupLocation="CenterScreen"
+        TextOptions.TextFormattingMode="Display"
+        UseLayoutRounding="True">
+
+    <!--
+        这是一个**小型 Windows 工具**，不是网页管理后台。
+        布局原则（每个页面都必须遵守）：
+          · 顶部一条紧凑工具栏（标题 + 导航标签 + 主要动作），不占左侧一大块
+          · 内容区就是「列表 + 小按钮 + 状态行」，不用大卡片、大圆角、大留白
+          · 默认窗口 780×520，用户需要更多空间可以自己放大
+    -->
+    <Window.Resources>
+        <local:OpToneConverter x:Key="OpTone" />
+        <local:ChangeToneConverter x:Key="ChangeTone" />
+        <local:BoolToVisibilityConverter x:Key="BoolVis" />
+        <local:NotNullToVisibilityConverter x:Key="NotNullVis" />
+        <local:DiffLineBackgroundConverter x:Key="DiffBg" />
+        <local:InverseBoolConverter x:Key="NotBool" />
+        <local:NavStateConverter x:Key="NavState" />
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />   <!-- 工具栏（标题 + 导航 + 动作） -->
+            <RowDefinition Height="Auto" />   <!-- 错误横幅 -->
+            <RowDefinition Height="*" />      <!-- 内容 -->
+            <RowDefinition Height="Auto" />   <!-- 状态栏 -->
+        </Grid.RowDefinitions>
+
+        <!-- ══════════════ 顶部工具栏 ══════════════ -->
+        <Border Grid.Row="0" Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="0,0,0,1">
+            <StackPanel>
+                <!-- 第一行：标题 + 右侧主要动作 -->
+                <DockPanel LastChildFill="False" Margin="8,5,8,0">
+                    <TextBlock DockPanel.Dock="Left" Text="回溯" FontSize="13" FontWeight="SemiBold"
+                               VerticalAlignment="Center" />
+                    <TextBlock DockPanel.Dock="Left" Text="文件后悔药" FontSize="10.5" Foreground="{StaticResource FgMuted}"
+                               VerticalAlignment="Center" Margin="8,0,0,0" />
+
+                    <Button DockPanel.Dock="Right" Content="记下现在的状态" Style="{StaticResource ToolPrimaryButton}"
+                            Command="{Binding CreateSnapshotCommand}"
+                            ToolTip="把当前文件状态记成一个时间点，之后可以回到这一刻" />
+                    <Button DockPanel.Dock="Right" Content="⟳" Style="{StaticResource ToolButton}" Margin="0,0,4,0"
+                            Command="{Binding RefreshCommand}" ToolTip="刷新" />
+                </DockPanel>
+
+                <!-- 第二行：一排小标签导航（不占左侧宽度） -->
+                <StackPanel Orientation="Horizontal" Margin="4,3,4,0">
+                    <Button Content="首页" Style="{StaticResource TabButton}"
+                            Command="{Binding NavigateCommand}" CommandParameter="home">
+                        <Button.Tag>
+                            <MultiBinding Converter="{StaticResource NavState}">
+                                <Binding Path="CommandParameter" RelativeSource="{RelativeSource Self}" />
+                                <Binding Path="DataContext.ActivePage" RelativeSource="{RelativeSource AncestorType=Window}" />
+                            </MultiBinding>
+                        </Button.Tag>
+                    </Button>
+                    <Button Content="历史" Style="{StaticResource TabButton}"
+                            Command="{Binding NavigateCommand}" CommandParameter="history">
+                        <Button.Tag>
+                            <MultiBinding Converter="{StaticResource NavState}">
+                                <Binding Path="CommandParameter" RelativeSource="{RelativeSource Self}" />
+                                <Binding Path="DataContext.ActivePage" RelativeSource="{RelativeSource AncestorType=Window}" />
+                            </MultiBinding>
+                        </Button.Tag>
+                    </Button>
+                    <Button Content="恢复" Style="{StaticResource TabButton}"
+                            Command="{Binding NavigateCommand}" CommandParameter="restore">
+                        <Button.Tag>
+                            <MultiBinding Converter="{StaticResource NavState}">
+                                <Binding Path="CommandParameter" RelativeSource="{RelativeSource Self}" />
+                                <Binding Path="DataContext.ActivePage" RelativeSource="{RelativeSource AncestorType=Window}" />
+                            </MultiBinding>
+                        </Button.Tag>
+                    </Button>
+                    <Button Content="设置" Style="{StaticResource TabButton}"
+                            Command="{Binding NavigateCommand}" CommandParameter="settings">
+                        <Button.Tag>
+                            <MultiBinding Converter="{StaticResource NavState}">
+                                <Binding Path="CommandParameter" RelativeSource="{RelativeSource Self}" />
+                                <Binding Path="DataContext.ActivePage" RelativeSource="{RelativeSource AncestorType=Window}" />
+                            </MultiBinding>
+                        </Button.Tag>
+                    </Button>
+
+                    <!-- 当前正在保护哪个文件夹（紧凑一行，选中多个时可切换） -->
+                    <TextBlock Text="正在保护：" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="16,0,4,0"
+                               Visibility="{Binding HasRoots, Converter={StaticResource BoolVis}}" />
+                    <ComboBox Width="180" Style="{StaticResource ToolCombo}" ItemsSource="{Binding Roots}"
+                              SelectedItem="{Binding SelectedRoot, Mode=TwoWay}"
+                              Visibility="{Binding HasMultipleRoots, Converter={StaticResource BoolVis}}">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding DisplayName}" FontSize="11.5" ToolTip="{Binding Path}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                        <ComboBox.ItemContainerStyle>
+                            <Style TargetType="ComboBoxItem">
+                                <Setter Property="ToolTip" Value="{Binding Path}" />
+                            </Style>
+                        </ComboBox.ItemContainerStyle>
+                    </ComboBox>
+                    <TextBlock Text="{Binding SelectedRootPath}" Style="{StaticResource Caption}" VerticalAlignment="Center"
+                               TextTrimming="CharacterEllipsis" MaxWidth="260" ToolTip="{Binding SelectedRootPath}"
+                               Visibility="{Binding HasMultipleRoots, Converter={StaticResource BoolVis}, ConverterParameter=invert}" />
+                    <TextBlock Text="{Binding SelectedRootStateText}" Style="{StaticResource Caption}" VerticalAlignment="Center"
+                               Margin="6,0,0,0" Foreground="{StaticResource Ok}"
+                               Visibility="{Binding HasRoots, Converter={StaticResource BoolVis}}" />
+                </StackPanel>
+            </StackPanel>
+        </Border>
+
+        <!-- ══════════════ 错误横幅 ══════════════ -->
+        <Border Grid.Row="1" Background="{StaticResource DangerDim}" BorderBrush="{StaticResource Danger}" BorderThickness="0,0,0,1"
+                Padding="8,4" Visibility="{Binding HasErrorBanner, Converter={StaticResource BoolVis}}">
+            <DockPanel LastChildFill="False">
+                <Button DockPanel.Dock="Right" Content="忽略" Style="{StaticResource ToolButton}" Margin="6,0,0,0"
+                        Command="{Binding DismissErrorCommand}" />
+                <TextBlock Text="{Binding LastErrorBanner}" TextWrapping="Wrap" FontSize="11.5" VerticalAlignment="Center" />
+            </DockPanel>
+        </Border>
+
+        <!-- ══════════════ 内容 ══════════════ -->
+        <Grid Grid.Row="2">
+
+            <!-- ────────── 首页：一个紧凑工作台 ────────── -->
+            <Grid Visibility="{Binding IsHomePage, Converter={StaticResource BoolVis}}" Margin="8,6,8,6">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- 没有任何受保护目录：只问一件事 —— 选一个文件夹 -->
+                <StackPanel Grid.Row="0" Grid.RowSpan="3" VerticalAlignment="Center" Margin="24,0"
+                            Visibility="{Binding HasRoots, Converter={StaticResource BoolVis}, ConverterParameter=invert}">
+                    <TextBlock Text="保护一个文件夹，之后文件改错、误删，都能回到之前的状态。"
+                               FontSize="12.5" TextWrapping="Wrap" />
+                    <Button Content="＋ 选择要保护的文件夹" Style="{StaticResource PrimaryButton}" Padding="14,6"
+                            HorizontalAlignment="Left" Margin="0,10,0,0" Command="{Binding PickFolderCommand}" />
+                    <TextBlock Text="{Binding FirstRunExamples}" Style="{StaticResource Caption}"
+                               FontFamily="{StaticResource MonoFont}" Margin="0,10,0,0" LineHeight="17" />
+                    <TextBlock Text="随时可以在「设置」里改保护范围和保存策略。" Style="{StaticResource Caption}" Margin="0,10,0,0" />
+                </StackPanel>
+
+                <!-- 有目录：状态一行 + 最近变化列表 -->
+                <StackPanel Grid.Row="0" Visibility="{Binding HasRoots, Converter={StaticResource BoolVis}}">
+                    <DockPanel LastChildFill="False">
+                        <TextBlock DockPanel.Dock="Left" Text="当前正在保护" Style="{StaticResource SectionTitle}"
+                                   Margin="0,0,6,0" VerticalAlignment="Center" />
+                        <TextBlock DockPanel.Dock="Left" Text="{Binding HomeProtectState}" FontSize="11.5" VerticalAlignment="Center"
+                                   Foreground="{StaticResource Ok}" />
+                    </DockPanel>
+                    <TextBlock Text="{Binding HomeRootPath}" FontSize="12.5" FontWeight="SemiBold" TextWrapping="Wrap" />
+
+                    <!-- 正在准备保护 -->
+                    <Border Margin="0,6,0,0" Padding="8,6" Background="{StaticResource BgPanel}"
+                            BorderBrush="{StaticResource Border}" BorderThickness="1"
+                            Visibility="{Binding HomeIsPreparing, Converter={StaticResource BoolVis}}">
+                        <StackPanel>
+                            <TextBlock Text="{Binding HomePreparingText}" TextWrapping="Wrap" FontSize="11.5" LineHeight="17" />
+                            <ProgressBar Height="5" Margin="0,6,0,0" Maximum="100"
+                                         Value="{Binding SelectedRoot.ScanPercent, Mode=OneWay}"
+                                         Visibility="{Binding SelectedRoot.HasScanProgress, Converter={StaticResource BoolVis}}" />
+                            <Button Content="取消" Style="{StaticResource ToolButton}" HorizontalAlignment="Left" Margin="0,6,0,0"
+                                    Command="{Binding CancelScanCommand}" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 准备失败 -->
+                    <Border Margin="0,6,0,0" Padding="8,6" Background="{StaticResource BgPanel}"
+                            BorderBrush="{StaticResource Warn}" BorderThickness="1"
+                            Visibility="{Binding SelectedRoot.HasError, Converter={StaticResource BoolVis}}">
+                        <StackPanel>
+                            <TextBlock Text="准备保护时出错了" FontSize="11.5" FontWeight="SemiBold" Foreground="{StaticResource Warn}" />
+                            <TextBlock Text="{Binding HomeScanFailedText}" TextWrapping="Wrap" FontSize="11.5" Margin="0,4,0,0" />
+                            <Button Content="重新扫描补齐" Style="{StaticResource ToolButton}" HorizontalAlignment="Left" Margin="0,6,0,0"
+                                    Command="{Binding RescanRootCommand}" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+
+                <!-- 最近变化：就是一张表，没有卡片 -->
+                <Grid Grid.Row="1" Margin="0,8,0,0" VerticalAlignment="Top"
+                      Visibility="{Binding HasRoots, Converter={StaticResource BoolVis}}">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" Text="最近变化" Style="{StaticResource SectionTitle}" />
+                    <ListBox Grid.Row="1" Style="{StaticResource ToolList}" ItemsSource="{Binding HomeRecentChanges}"
+                             Height="{Binding HomeRecentListHeight}"
+                             VerticalAlignment="Top">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="58" />
+                                        <ColumnDefinition Width="46" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="{Binding TimeText}" FontFamily="{StaticResource MonoFont}"
+                                               FontSize="11.5" Foreground="{StaticResource FgSecondary}" />
+                                    <TextBlock Grid.Column="1" Text="{Binding OpText}" FontSize="11.5"
+                                               Foreground="{Binding OpTone, Converter={StaticResource OpTone}}" />
+                                    <TextBlock Grid.Column="2" Text="{Binding PathText}" FontSize="11.5"
+                                               TextTrimming="CharacterEllipsis" ToolTip="{Binding PathText}" />
+                                    <TextBlock Grid.Column="3" Text="{Binding SizeText}" Style="{StaticResource Caption}" Margin="6,0,0,0" />
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                    <TextBlock Grid.Row="1" Text="{Binding HomeNoChangeText}" Style="{StaticResource Caption}"
+                               TextAlignment="Center" HorizontalAlignment="Center" VerticalAlignment="Center"
+                               TextWrapping="Wrap" MaxWidth="330" LineHeight="17"
+                               Visibility="{Binding HomeHasRecent, Converter={StaticResource BoolVis}, ConverterParameter=invert}" />
+                    <TextBlock Grid.Row="2" Text="{Binding HomeReadyText}" Style="{StaticResource Caption}" TextWrapping="Wrap"
+                               Margin="0,6,0,0" LineHeight="17"
+                               Visibility="{Binding HomeIsReady, Converter={StaticResource BoolVis}}" />
+                </Grid>
+
+                <!-- 底部两个动作，就一行 -->
+                <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,8,0,0"
+                            Visibility="{Binding HasRoots, Converter={StaticResource BoolVis}}">
+                    <Button Content="查看历史" Style="{StaticResource ToolButton}" Margin="0,0,6,0" Command="{Binding GoHistoryCommand}" />
+                    <Button Content="找回之前的状态" Style="{StaticResource ToolPrimaryButton}" Command="{Binding GoRestoreCommand}"
+                            ToolTip="选一个时间点，把文件恢复到那一刻；恢复错了可以撤销" />
+                </StackPanel>
+            </Grid>
+
+            <!-- ────────── 历史：一张表 + 右侧详情 ────────── -->
+            <Grid Visibility="{Binding IsTimelinePage, Converter={StaticResource BoolVis}}" Margin="8,6,8,6">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="270" />
+                </Grid.ColumnDefinitions>
+
+                <Grid Grid.Column="0" Margin="0,0,6,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <!-- 过滤条：一行，紧凑 -->
+                    <DockPanel Grid.Row="0" LastChildFill="False" Margin="0,0,0,4">
+                        <TextBox DockPanel.Dock="Left" Width="180" Style="{StaticResource ToolBox}"
+                                 Text="{Binding TimelineFilter, UpdateSourceTrigger=PropertyChanged, Delay=250}"
+                                 ToolTip="按路径、程序或操作类型过滤" />
+                        <ComboBox DockPanel.Dock="Left" Width="86" Style="{StaticResource ToolCombo}" Margin="4,0,0,0"
+                                  SelectedValue="{Binding TimelineDays, Mode=TwoWay}" SelectedValuePath="Tag">
+                            <ComboBoxItem Content="近 1 天" Tag="1" />
+                            <ComboBoxItem Content="近 3 天" Tag="3" />
+                            <ComboBoxItem Content="近 7 天" Tag="7" />
+                            <ComboBoxItem Content="近 30 天" Tag="30" />
+                        </ComboBox>
+                        <CheckBox DockPanel.Dock="Left" Content="瞬时变化" IsChecked="{Binding ShowTransient}"
+                                  FontSize="11.5" VerticalAlignment="Center" Margin="6,0,0,0" />
+                        <Button DockPanel.Dock="Right" Content="找回之前的状态" Style="{StaticResource ToolPrimaryButton}"
+                                Command="{Binding GoRestoreCommand}" />
+                    </DockPanel>
+
+                    <!-- 变化列表（表格式） -->
+                    <Grid Grid.Row="1">
+                        <ListBox Style="{StaticResource ToolList}" ItemsSource="{Binding Events}"
+                                 SelectedItem="{Binding SelectedEvent, Mode=TwoWay}">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="58" />
+                                            <ColumnDefinition Width="46" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Grid.Column="0" Text="{Binding TimeText}" FontFamily="{StaticResource MonoFont}"
+                                                   FontSize="11.5" Foreground="{StaticResource FgSecondary}" />
+                                        <TextBlock Grid.Column="1" Text="{Binding OpText}" FontSize="11.5"
+                                                   Foreground="{Binding OpTone, Converter={StaticResource OpTone}}" />
+                                        <TextBlock Grid.Column="2" Text="{Binding PathText}" FontSize="11.5"
+                                                   TextTrimming="CharacterEllipsis" ToolTip="{Binding PathText}" />
+                                        <TextBlock Grid.Column="3" Text="{Binding BadgeText}" Style="{StaticResource Caption}"
+                                                   Margin="6,0,0,0"
+                                                   Visibility="{Binding HasBadge, Converter={StaticResource BoolVis}}" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                        <TextBlock Text="还没有文件变化记录。&#x0a;你修改、创建或删除文件后，变化会自动出现在这里。"
+                                   Style="{StaticResource Caption}" TextAlignment="Center" HorizontalAlignment="Center"
+                                   VerticalAlignment="Center" TextWrapping="Wrap" MaxWidth="300" LineHeight="17"
+                                   Visibility="{Binding TimelineIsEmpty, Converter={StaticResource BoolVis}}" />
+                    </Grid>
+                </Grid>
+
+                <!-- 详情：选中的那一条 -->
+                <Grid Grid.Column="1">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" Text="这一条的详细情况" Style="{StaticResource SectionTitle}" />
+                    <Border Grid.Row="1" Background="{StaticResource BgWindow}" BorderBrush="{StaticResource Border}" BorderThickness="1">
+                        <ScrollViewer VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Hidden" Margin="6,4">
+                            <TextBlock Text="{Binding SelectedEventDetail}" TextWrapping="Wrap" FontSize="11.5" LineHeight="17" />
+                        </ScrollViewer>
+                    </Border>
+                    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,4,0,0"
+                                Visibility="{Binding HasSelectedEvent, Converter={StaticResource BoolVis}}">
+                        <Button Content="看这个文件的历史" Style="{StaticResource ToolButton}"
+                                Command="{Binding ShowFileCommand}" CommandParameter="{Binding SelectedEvent}" />
+                        <Button Content="删除这条记录" Style="{StaticResource ToolDangerButton}" Margin="4,0,0,0"
+                                Command="{Binding DeleteSelectedEventCommand}"
+                                AutomationProperties.Name="删除这条记录"
+                                ToolTip="只删除这条变化记录，磁盘上的文件不会被改动" />
+                    </StackPanel>
+                </Grid>
+            </Grid>
+
+            <!-- ────────── 恢复：紧凑控制面板（同一页完成四步） ────────── -->
+            <Grid Visibility="{Binding IsRestorePage, Converter={StaticResource BoolVis}}" Margin="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- 顶部工具栏：时间点 → 恢复到  → 确认恢复 -->
+                <Border Grid.Row="0" Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}"
+                        BorderThickness="0,0,0,1" Padding="8,5">
+                    <DockPanel LastChildFill="False">
+                        <Button DockPanel.Dock="Right" Content="确认恢复" Style="{StaticResource ToolDangerButton}"
+                                Command="{Binding ConfirmRestoreFromPanelCommand}"
+                                IsEnabled="{Binding CanConfirmRestore}"
+                                ToolTip="只恢复勾选的那些文件；执行前会自动创建安全点" />
+
+                        <Button DockPanel.Dock="Right" Style="{StaticResource ToolButton}" Margin="6,0"
+                                Command="{Binding SwapRestoreEndsCommand}"
+                                AutomationProperties.Name="交换恢复方向"
+                                ToolTip="交换两端：改变「把谁恢复到哪」的方向">
+                            <TextBlock Text="⇄" FontSize="13" />
+                        </Button>
+
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock Text="{Binding TargetArrowLabel}" Style="{StaticResource Caption}" VerticalAlignment="Center"
+                                       Margin="0,0,3,0" />
+                            <ComboBox Width="130" Style="{StaticResource ToolCombo}" ItemsSource="{Binding TargetPointChoices}"
+                                      SelectedItem="{Binding SelectedTargetPoint, Mode=TwoWay}"
+                                      ToolTip="恢复到另一个时间点；点右边「当前状态」回到现在">
+                                <ComboBox.ItemTemplate>
+                                    <DataTemplate><TextBlock Text="{Binding FriendlyTime}" FontSize="11.5" /></DataTemplate>
+                                </ComboBox.ItemTemplate>
+                            </ComboBox>
+                            <TextBlock Text="{Binding TargetEndText}" FontSize="11.5" VerticalAlignment="Center"
+                                       Margin="4,0,0,0" TextTrimming="CharacterEllipsis" MaxWidth="110" />
+                            <Button Content="当前状态" Style="{StaticResource ToolButton}" Margin="4,0,0,0"
+                                    Command="{Binding UseCurrentStateAsTargetCommand}" />
+                        </StackPanel>
+
+                        <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock Text="时间点" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,3,0" />
+                            <ComboBox Width="130" Style="{StaticResource ToolCombo}" ItemsSource="{Binding TimePointChoices}"
+                                      SelectedItem="{Binding SelectedTimePointChoice, Mode=TwoWay}"
+                                      ToolTip="选一个要回到的时间点">
+                                <ComboBox.ItemTemplate>
+                                    <DataTemplate><TextBlock Text="{Binding FriendlyTime}" FontSize="11.5" /></DataTemplate>
+                                </ComboBox.ItemTemplate>
+                            </ComboBox>
+                            <TextBlock Text="{Binding FromEndText}" FontSize="11.5" FontWeight="SemiBold" VerticalAlignment="Center"
+                                       Margin="4,0,0,0" />
+                        </StackPanel>
+                    </DockPanel>
+                </Border>
+
+                <!-- 迷你文件浏览器：显示"当前时间点"里这个目录下的真实文件结构 -->
+                <!-- ⚠ 必须放在 Height="*" 的那一行（第 3 行）。放进 Auto 行会让列表被"无限高度"测量：
+                     200 个文件全部渲染、高度撑到 5000+ px 溢出窗口，
+                     于是既没有内部滚动条（滚轮没用），每次勾选又要重排全部行（卡）。 -->
+                <Grid Grid.Row="3" Margin="8,5,8,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <!-- 导航行：时间点 + 当前目录 + 返回上级 -->
+                    <DockPanel Grid.Row="0" LastChildFill="False" Margin="0,0,0,3">
+                        <Button DockPanel.Dock="Left" Content="↑ 上级" Style="{StaticResource ToolButton}"
+                                Command="{Binding GoUpDirectoryCommand}" IsEnabled="{Binding CanGoUp}" />
+                        <Button DockPanel.Dock="Left" Content="⌂ 根目录" Style="{StaticResource ToolButton}" Margin="4,0,0,0"
+                                Command="{Binding GoRootDirectoryCommand}" />
+                        <TextBlock DockPanel.Dock="Left" Text="{Binding BrowseHeader}" FontSize="11.5" FontWeight="SemiBold"
+                                   VerticalAlignment="Center" Margin="8,0,0,0" TextTrimming="CharacterEllipsis" />
+                    </DockPanel>
+
+                    <!-- 文件列表：双击文件夹进入，勾选文件加入恢复集合 -->
+                    <Grid Grid.Row="1">
+                        <ListBox x:Name="RestoreBrowser" Style="{StaticResource ToolList}" ItemsSource="{Binding RestoreBrowse}"
+                                 MouseDoubleClick="OnRestoreBrowseDoubleClick">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="24" />
+                                            <ColumnDefinition Width="20" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <CheckBox Grid.Column="0" VerticalAlignment="Center"
+                                                  IsChecked="{Binding IsSelected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                  IsEnabled="{Binding CanSelect}" />
+                                        <TextBlock Grid.Column="1" Text="{Binding Icon}" FontSize="11.5" VerticalAlignment="Center" />
+                                        <TextBlock Grid.Column="2" Text="{Binding DisplayName}" FontSize="11.5"
+                                                   TextTrimming="CharacterEllipsis" ToolTip="{Binding RelativePath}"
+                                                   VerticalAlignment="Center">
+                                            <TextBlock.Style>
+                                                <!--
+                                                    必须 BasedOn 应用级隐式样式：
+                                                    一旦给控件显式设了 Style，隐式样式就不再生效，
+                                                    前景色会回落到默认的黑色（深色界面上就是"文件名变黑看不见"）。
+                                                -->
+                                                <Style TargetType="TextBlock" BasedOn="{StaticResource {x:Type TextBlock}}">
+                                                    <Style.Triggers>
+                                                        <!-- 标记删除的行：变警示色，且名字后面已经带了"（将删除）"文字，
+                                                             不靠颜色单独表达 -->
+                                                        <DataTrigger Binding="{Binding IsMarkedForDeletion}" Value="True">
+                                                            <Setter Property="Foreground" Value="{StaticResource Warn}" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                        <TextBlock Grid.Column="3" Text="{Binding TimeText}" Style="{StaticResource Caption}"
+                                                   VerticalAlignment="Center" Margin="6,0,0,0" />
+                                        <TextBlock Grid.Column="4" Text="{Binding SizeText}" Style="{StaticResource Caption}"
+                                                   VerticalAlignment="Center" Margin="8,0,0,0" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+
+                        <TextBlock Text="{Binding BrowseEmptyText}" Style="{StaticResource Caption}"
+                                   TextAlignment="Center" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                   TextWrapping="Wrap" MaxWidth="330" LineHeight="17"
+                                   Visibility="{Binding BrowseIsEmpty, Converter={StaticResource BoolVis}}" />
+                    </Grid>
+                </Grid>
+
+                <!-- 底部：全选/反选/取消全选（只作用于当前列表）+ 恢复集合 -->
+                <Border Grid.Row="4" Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}"
+                        BorderThickness="0,1,0,0" Padding="8,4">
+                    <StackPanel>
+                        <DockPanel LastChildFill="False">
+                            <Button DockPanel.Dock="Left" Content="全选" Style="{StaticResource ToolButton}"
+                                    Command="{Binding SelectAllRestoreFilesCommand}" ToolTip="只选中当前列表里的文件" />
+                            <Button DockPanel.Dock="Left" Content="取消全选" Style="{StaticResource ToolButton}" Margin="4,0,0,0"
+                                    Command="{Binding ClearRestoreSelectionCommand}" />
+                            <Button DockPanel.Dock="Left" Content="反选" Style="{StaticResource ToolButton}" Margin="4,0,0,0"
+                                    Command="{Binding InvertRestoreSelectionCommand}" ToolTip="把当前列表的勾选状态取反" />
+
+                            <!-- 自定义删除：勾选文件 → 标记删除。标记后执行时把它删掉（同样先留安全点） -->
+                            <Button DockPanel.Dock="Left" Content="标记删除" Style="{StaticResource ToolDangerButton}" Margin="12,0,0,0"
+                                    Command="{Binding MarkDeletionCommand}"
+                                    AutomationProperties.Name="标记删除"
+                                    ToolTip="把当前勾选的文件标记为「要删除」；执行恢复时它们会被删除，删错了可撤销" />
+                            <Button DockPanel.Dock="Left" Content="取消标记" Style="{StaticResource ToolButton}" Margin="4,0,0,0"
+                                    Command="{Binding UnmarkDeletionCommand}"
+                                    ToolTip="取消当前目录里的删除标记" />
+
+                            <!-- 恢复集合入口：点开就能看到已选文件、也能删掉某一项 -->
+                            <Button DockPanel.Dock="Right" Style="{StaticResource ToolButton}"
+                                    Command="{Binding TogglePickedListCommand}"
+                                    Content="{Binding PickedSummary}"
+                                    ToolTip="查看/编辑恢复集合（来自不同时间点的文件会一起列在这里）" />
+                            <Button DockPanel.Dock="Right" Content="清空集合" Style="{StaticResource ToolButton}" Margin="0,0,4,0"
+                                    Command="{Binding ClearAllPickedCommand}"
+                                    ToolTip="清空恢复集合与全部删除标记" />
+
+                            <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" Margin="12,0,0,0" VerticalAlignment="Center"
+                                        Visibility="{Binding IsRestoreDone, Converter={StaticResource BoolVis}}">
+                                <TextBlock Text="{Binding RestoreDoneHeadline}" FontSize="11.5" FontWeight="SemiBold"
+                                           Foreground="{StaticResource Ok}" VerticalAlignment="Center" Margin="0,0,6,0" />
+                                <Button Content="撤销" Style="{StaticResource ToolDangerButton}"
+                                        Command="{Binding UndoLastRestoreCommand}"
+                                        Visibility="{Binding RestoreDoneCanUndo, Converter={StaticResource BoolVis}}"
+                                        ToolTip="把文件恢复到这次恢复之前的状态" />
+                            </StackPanel>
+                        </DockPanel>
+
+                        <!-- 恢复集合清单（默认收起） -->
+                        <Border Margin="0,4,0,0" MaxHeight="130" Background="{StaticResource BgWindow}"
+                                BorderBrush="{StaticResource Border}" BorderThickness="1"
+                                Visibility="{Binding PickedListOpen, Converter={StaticResource BoolVis}}">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+                                <TextBlock Grid.Row="0" Text="恢复集合（来自不同时间点的文件会合在一起执行；标记删除的项也会列在这里）"
+                                           Style="{StaticResource Caption}" Margin="6,4,6,2" />
+                                <ListBox Grid.Row="1" Style="{StaticResource ToolList}" ItemsSource="{Binding RestorePicked}">
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <DockPanel LastChildFill="False">
+                                                <Button DockPanel.Dock="Right" Content="✕" Style="{StaticResource ToolButton}"
+                                                        Padding="6,0" Margin="6,0,0,0"
+                                                        Command="{Binding DataContext.RemovePickedCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        CommandParameter="{Binding}"
+                                                        ToolTip="从集合里去掉这一项" />
+                                                <TextBlock DockPanel.Dock="Left" Text="{Binding SourceText}"
+                                                           VerticalAlignment="Center" Margin="0,0,8,0">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock" BasedOn="{StaticResource Caption}">
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsDeletion}" Value="True">
+                                                                    <Setter Property="Foreground" Value="{StaticResource Warn}" />
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
+                                                <TextBlock Text="{Binding DisplayFull}" FontSize="11.5"
+                                                           TextTrimming="CharacterEllipsis" VerticalAlignment="Center">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock" BasedOn="{StaticResource {x:Type TextBlock}}">
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsDeletion}" Value="True">
+                                                                    <Setter Property="Foreground" Value="{StaticResource Warn}" />
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
+                                            </DockPanel>
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                </ListBox>
+                            </Grid>
+                        </Border>
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <!-- ────────── 文件历史 + 内容对比（从历史里点进来） ────────── -->
+            <Grid Visibility="{Binding IsFilesPage, Converter={StaticResource BoolVis}}" Margin="8,6,8,6">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="215" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Grid Grid.Column="0" Margin="0,0,6,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <Button Grid.Row="0" Content="← 返回历史" Style="{StaticResource ToolButton}" HorizontalAlignment="Left"
+                            Margin="0,0,0,4" Command="{Binding GoHistoryCommand}" />
+                    <TextBox Grid.Row="1" Style="{StaticResource ToolBox}" Margin="0,0,0,4"
+                             Text="{Binding FileSearch, UpdateSourceTrigger=PropertyChanged, Delay=250}"
+                             ToolTip="按文件名或路径搜索" />
+                    <ListBox Grid.Row="2" Style="{StaticResource ToolList}" ItemsSource="{Binding Files}"
+                             SelectedItem="{Binding SelectedFile, Mode=TwoWay}">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel>
+                                    <TextBlock Text="{Binding Name}" FontSize="11.5" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="{Binding Directory}" Style="{StaticResource Caption}" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Grid>
+
+                <Grid Grid.Column="1">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0" Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}"
+                            BorderThickness="1" Padding="6,4" Margin="0,0,0,4">
+                        <StackPanel>
+                            <TextBlock Text="{Binding SelectedFile.RelativePath}" FontSize="11.5" TextWrapping="Wrap" />
+                            <DockPanel LastChildFill="False" Margin="0,4,0,0">
+                                <TextBlock DockPanel.Dock="Left" Text="比较：" Style="{StaticResource Caption}" VerticalAlignment="Center" />
+                                <ComboBox DockPanel.Dock="Left" Width="140" Style="{StaticResource ToolCombo}" Margin="0,0,4,0"
+                                          ItemsSource="{Binding Versions}" SelectedItem="{Binding SelectedVersionA, Mode=TwoWay}"
+                                          ToolTip="旧版本" />
+                                <ComboBox DockPanel.Dock="Left" Width="140" Style="{StaticResource ToolCombo}" Margin="0,0,4,0"
+                                          ItemsSource="{Binding Versions}" SelectedItem="{Binding SelectedVersionB, Mode=TwoWay}"
+                                          ToolTip="新版本" />
+                                <Button DockPanel.Dock="Left" Content="交换" Style="{StaticResource ToolButton}"
+                                        Command="{Binding SwapDiffCommand}" />
+                            </DockPanel>
+                            <TextBlock Text="{Binding DiffMeta}" Style="{StaticResource Caption}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                        </StackPanel>
+                    </Border>
+
+                    <TextBlock Grid.Row="1" Text="{Binding DiffSummary}" FontSize="11.5" Margin="0,0,0,4" />
+
+                    <Border Grid.Row="2" Background="{StaticResource BgWindow}" BorderBrush="{StaticResource Border}" BorderThickness="1">
+                        <ScrollViewer HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Hidden">
+                            <ItemsControl ItemsSource="{Binding DiffRows}" FontFamily="{StaticResource MonoFont}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Background="{Binding Kind, Converter={StaticResource DiffBg}}" Padding="4,0">
+                                            <StackPanel Orientation="Horizontal">
+                                                <TextBlock Text="{Binding OldLineDisplay}" Width="42" TextAlignment="Right"
+                                                           Foreground="{StaticResource FgDisable}" FontSize="11" Margin="0,0,4,0" />
+                                                <TextBlock Text="{Binding NewLineDisplay}" Width="42" TextAlignment="Right"
+                                                           Foreground="{StaticResource FgDisable}" FontSize="11" Margin="0,0,4,0" />
+                                                <TextBlock Text="{Binding Marker}" Width="10" FontWeight="SemiBold" FontSize="11" />
+                                                <TextBlock Text="{Binding Text}" Style="{StaticResource DiffText}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </Border>
+                </Grid>
+            </Grid>
+
+            <!-- ────────── 设置：普通设置 + 折叠的高级设置 ────────── -->
+            <!-- 设置页：整页设置比窗口高，**必须**有一个可靠的滚动方式。
+                 实测：这台机器上 ScrollViewer/ListBox 配 Hidden 垂直条时收不到滚轮事件，
+                 所以这里保留一条细滚动条 —— 内容多的时候用户至少能滚。
+                 （列表类页面用 Hidden + 滚轮是正常的，见 ToolList。） -->
+            <ListBox Visibility="{Binding IsSettingsPage, Converter={StaticResource BoolVis}}"
+                     Background="Transparent" BorderThickness="0" Focusable="False"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto"
+                     ScrollViewer.CanContentScroll="True">
+                <ListBox.ItemContainerStyle>
+                    <Style TargetType="ListBoxItem">
+                        <Setter Property="Padding" Value="0" />
+                        <Setter Property="Margin" Value="0" />
+                        <Setter Property="Focusable" Value="False" />
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="ListBoxItem">
+                                    <ContentPresenter />
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </ListBox.ItemContainerStyle>
+                <StackPanel Margin="8,6,8,8">
+
+                    <!-- 保护文件夹 -->
+                    <TextBlock Text="保护文件夹" Style="{StaticResource SectionTitle}" />
+                    <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                        <StackPanel>
+                        <ItemsControl ItemsSource="{Binding Roots}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <DockPanel Margin="0,0,0,4" LastChildFill="False">
+                                        <!-- 每个文件夹旁边就有删除入口：不该让用户去高级设置里找 -->
+                                        <Button DockPanel.Dock="Right" Content="✕ 移除" Style="{StaticResource ToolDangerButton}"
+                                                Margin="6,0,0,0" VerticalAlignment="Top"
+                                                Command="{Binding DataContext.RemoveRootRowCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                CommandParameter="{Binding}"
+                                                AutomationProperties.Name="移除这个保护文件夹"
+                                                ToolTip="把这个文件夹移出保护范围（会问你历史记录怎么处理）" />
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding Path}" FontSize="11.5" TextWrapping="Wrap" />
+                                            <StackPanel Orientation="Horizontal">
+                                                <TextBlock Text="{Binding ProtectStateText}" Style="{StaticResource Caption}" />
+                                                <TextBlock Text=" · " Style="{StaticResource Caption}" />
+                                                <TextBlock Text="{Binding StatsText}" Style="{StaticResource Caption}" />
+                                            </StackPanel>
+                                            <ProgressBar Height="4" Margin="0,3,0,0" Maximum="100"
+                                                         Value="{Binding ScanPercent, Mode=OneWay}"
+                                                         IsIndeterminate="{Binding HasScanProgress, Converter={StaticResource NotBool}}"
+                                                         Visibility="{Binding Scanning, Converter={StaticResource BoolVis}}" />
+                                            <TextBlock Text="{Binding BaselineWarning}" Style="{StaticResource Caption}"
+                                                       Foreground="{StaticResource Warn}" TextWrapping="Wrap"
+                                                       Visibility="{Binding HasBaselineWarning, Converter={StaticResource BoolVis}}" />
+                                            <Button Content="现在补扫完" Style="{StaticResource ToolButton}" HorizontalAlignment="Left" Margin="0,3,0,0"
+                                                    Command="{Binding DataContext.RescanRootCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                    Visibility="{Binding HasBaselineWarning, Converter={StaticResource BoolVis}}" />
+                                        </StackPanel>
+                                    </DockPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                            <Button Content="＋ 选择文件夹" Style="{StaticResource ToolPrimaryButton}" Command="{Binding PickFolderCommand}" />
+                            <Button Content="保存设置" Style="{StaticResource ToolButton}" Margin="4,0,0,0" Command="{Binding SaveSettingsCommand}" />
+                        </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 保留多久：只有几档，用单选按钮最直接，也避免下拉框选中项显示不出来的问题 -->
+                    <TextBlock Text="保存历史" Style="{StaticResource SectionTitle}" Margin="0,8,0,4" />
+                    <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                        <DockPanel LastChildFill="False">
+                            <TextBlock DockPanel.Dock="Left" Text="保留" Style="{StaticResource Caption}" VerticalAlignment="Center"
+                                       Margin="0,0,6,0" />
+                            <RadioButton DockPanel.Dock="Left" GroupName="Retention" Content="7 天" FontSize="11.5"
+                                         VerticalAlignment="Center" Margin="0,0,10,0" IsChecked="{Binding RetentionIs7}" />
+                            <RadioButton DockPanel.Dock="Left" GroupName="Retention" Content="30 天" FontSize="11.5"
+                                         VerticalAlignment="Center" Margin="0,0,10,0" IsChecked="{Binding RetentionIs30}" />
+                            <RadioButton DockPanel.Dock="Left" GroupName="Retention" Content="90 天" FontSize="11.5"
+                                         VerticalAlignment="Center" Margin="0,0,10,0" IsChecked="{Binding RetentionIs90}" />
+                            <Button DockPanel.Dock="Left" Content="保存" Style="{StaticResource ToolButton}"
+                                    Command="{Binding SaveSettingsCommand}" />
+                            <TextBlock DockPanel.Dock="Right" Text="{Binding RetentionCustomText}" Style="{StaticResource Caption}"
+                                       VerticalAlignment="Center" Visibility="{Binding RetentionIsCustom, Converter={StaticResource BoolVis}}" />
+                        </DockPanel>
+                    </Border>
+
+                    <!-- 磁盘空间 -->
+                    <TextBlock Text="磁盘空间" Style="{StaticResource SectionTitle}" Margin="0,8,0,4" />
+                    <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                        <StackPanel>
+                            <DockPanel LastChildFill="False">
+                                <TextBlock DockPanel.Dock="Left" Text="最多使用" Style="{StaticResource Caption}" VerticalAlignment="Center"
+                                           Margin="0,0,4,0" />
+                                <TextBox DockPanel.Dock="Left" Width="60" Style="{StaticResource ToolBox}"
+                                         Text="{Binding SettingMaxHistoryGb, UpdateSourceTrigger=LostFocus}" />
+                                <TextBlock DockPanel.Dock="Left" Text="GB" Style="{StaticResource Caption}" VerticalAlignment="Center"
+                                           Margin="4,0,0,0" />
+                                <Button DockPanel.Dock="Left" Content="保存" Style="{StaticResource ToolButton}" Margin="4,0,0,0"
+                                        Command="{Binding SaveSettingsCommand}" />
+                            </DockPanel>
+                            <TextBlock Text="{Binding StorageSummary}" Style="{StaticResource Caption}" TextWrapping="Wrap"
+                                       Margin="0,4,0,0" LineHeight="16" />
+                            <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap" Margin="0,2,0,0" Opacity="0.75"
+                                       Text="这些数字在这页开着的时候会自动更新（每几秒一次）。" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 存储位置：数据与运行日志放哪个盘 -->
+                    <TextBlock Text="存储位置" Style="{StaticResource SectionTitle}" Margin="0,8,0,4" />
+                    <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                        <StackPanel>
+                            <TextBlock Text="{Binding StorageLocationText}" Style="{StaticResource Caption}"
+                                       TextWrapping="Wrap" LineHeight="16" />
+                            <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                <Button Content="改到别的文件夹…" Style="{StaticResource ToolPrimaryButton}"
+                                        Command="{Binding PickStorageFolderCommand}"
+                                        AutomationProperties.Name="改到别的文件夹"
+                                        ToolTip="历史数据与运行日志都放到你选的文件夹（改完重启程序生效）" />
+                                <Button Content="打开当前位置" Style="{StaticResource ToolButton}" Margin="4,0,0,0"
+                                        Command="{Binding OpenStorageFolderCommand}" />
+                                <Button Content="改回默认" Style="{StaticResource ToolButton}" Margin="4,0,0,0"
+                                        Command="{Binding ResetStorageFolderCommand}" />
+                                <Button Content="打开日志目录" Style="{StaticResource ToolButton}" Margin="4,0,0,0"
+                                        Command="{Binding OpenLogFolderCommand}"
+                                        AutomationProperties.Name="打开日志目录"
+                                        ToolTip="查看崩溃日志写了什么；日志只记异常与路径，本机路径已自动打码" />
+                            </StackPanel>
+                            <TextBlock Text="{Binding PendingStorageText}" FontSize="11.5" TextWrapping="Wrap"
+                                       Foreground="{StaticResource Warn}" Margin="0,4,0,0" LineHeight="16"
+                                       Visibility="{Binding HasPendingStorage, Converter={StaticResource BoolVis}}" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 清理变化记录 -->
+                    <TextBlock Text="清理变化记录" Style="{StaticResource SectionTitle}" Margin="0,8,0,4" />
+                    <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap" LineHeight="16"
+                                       Text="删除「谁在什么时候改了什么」这些记录。磁盘上的文件不会被改动，已存在的恢复点仍然可以恢复。删除后无法撤销。" />
+                            <Button Content="清空当前范围的变化记录" Style="{StaticResource ToolDangerButton}"
+                                    HorizontalAlignment="Left" Margin="0,6,0,0"
+                                    Command="{Binding ClearAllEventsCommand}"
+                                    AutomationProperties.Name="清空变化记录" />
+                            <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap" LineHeight="16" Margin="0,6,0,0"
+                                       Text="如果要真正把占用的磁盘空间还回去（内容库通常是大头），用下面这个：连同恢复点与内容库一起清空。" />
+                            <Button Content="清空全部历史数据（含恢复点与内容库）" Style="{StaticResource ToolDangerButton}"
+                                    HorizontalAlignment="Left" Margin="0,6,0,0"
+                                    Command="{Binding PurgeAllHistoryCommand}"
+                                    AutomationProperties.Name="清空全部历史数据" />
+                        </StackPanel>
+                    </Border>
+                    <!-- 危险区：清空全部数据 -->
+                    <TextBlock Text="清空全部数据" Style="{StaticResource SectionTitle}" Margin="0,8,0,4" />
+                    <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap" LineHeight="16"
+                                       Text="把保护范围登记、变化记录、恢复点、内容库全部删除，回到「从没用过」的状态。磁盘上的原始文件不会被删除或修改。" />
+                            <Button Content="清空全部数据并移除保护范围" Style="{StaticResource ToolDangerButton}"
+                                    HorizontalAlignment="Left" Margin="0,6,0,0"
+                                    Command="{Binding ClearAllDataCommand}"
+                                    AutomationProperties.Name="清空全部数据" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 高级设置：默认折叠 -->
+                    <Button Style="{StaticResource ToolButton}" HorizontalAlignment="Left" Margin="0,8,0,0" Padding="8,3"
+                            Command="{Binding ShowAdvancedSettingsCommand}"
+                            Visibility="{Binding BasicSettingsOnly, Converter={StaticResource BoolVis}}"
+                            Content="高级设置 ▸" />
+                    <Button Style="{StaticResource ToolButton}" HorizontalAlignment="Left" Margin="0,8,0,0" Padding="8,3"
+                            Command="{Binding HideAdvancedSettingsCommand}"
+                            Visibility="{Binding AdvancedSettingsOpen, Converter={StaticResource BoolVis}}"
+                            Content="高级设置 ▾" />
+
+                    <StackPanel Visibility="{Binding AdvancedSettingsOpen, Converter={StaticResource BoolVis}}">
+
+                        <TextBlock Text="保护模式（决定能不能恢复文件内容）" Style="{StaticResource SectionTitle}" Margin="0,8,0,4" />
+                        <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                            <StackPanel>
+                                <RadioButton GroupName="ProtectionMode" IsChecked="{Binding IsModeFull}" FontSize="11.5">
+                                    <StackPanel>
+                                        <TextBlock Text="完整内容" FontSize="11.5" />
+                                        <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap"
+                                                   Text="留存所有文件的历史内容。恢复能力最强；首次扫描最慢，历史占用最高。" />
+                                    </StackPanel>
+                                </RadioButton>
+                                <RadioButton GroupName="ProtectionMode" IsChecked="{Binding IsModeSmart}" FontSize="11.5" Margin="0,3,0,0">
+                                    <StackPanel>
+                                        <TextBlock Text="智能留存（推荐）" FontSize="11.5" />
+                                        <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap"
+                                                   Text="只留存小文件的内容，大文件只记录「它变了」。适合代码 / 配置 / 文档目录。" />
+                                        <StackPanel Orientation="Horizontal" Margin="0,2,0,0">
+                                            <TextBlock Text="留存上限 (MB)：" Style="{StaticResource Caption}" VerticalAlignment="Center" />
+                                            <TextBox Width="60" Style="{StaticResource ToolBox}" Margin="4,0,0,0"
+                                                     Text="{Binding SettingSmartMaxMb, UpdateSourceTrigger=LostFocus}" />
+                                        </StackPanel>
+                                    </StackPanel>
+                                </RadioButton>
+                                <RadioButton GroupName="ProtectionMode" IsChecked="{Binding IsModeTrack}" FontSize="11.5" Margin="0,3,0,0">
+                                    <StackPanel>
+                                        <TextBlock Text="只记录变化" FontSize="11.5" />
+                                        <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap"
+                                                   Text="只记录「哪个文件何时发生了什么变化」，不留存内容。最快最省，但无法恢复文件内容。" />
+                                    </StackPanel>
+                                </RadioButton>
+                                <TextBlock Text="{Binding ProtectionModeHint}" Style="{StaticResource Caption}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                <TextBlock Text="⚠ 当前为「只记录变化」：能看到变化，但恢复时无法还原文件内容。"
+                                           Style="{StaticResource Caption}" TextWrapping="Wrap" Foreground="{StaticResource Warn}"
+                                           Margin="0,2,0,0"
+                                           Visibility="{Binding IsTrackOnlyMode, Converter={StaticResource BoolVis}}" />
+                            </StackPanel>
+                        </Border>
+
+                        <TextBlock Text="受保护文件夹的操作" Style="{StaticResource SectionTitle}" Margin="0,8,0,4" />
+                        <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                            <StackPanel>
+                                <TextBlock Text="针对顶部当前选中的那个文件夹。" Style="{StaticResource Caption}" Margin="0,0,0,4" />
+                                <StackPanel Orientation="Horizontal">
+                                    <Button Content="暂停/恢复" Style="{StaticResource ToolButton}" Margin="0,0,4,0" Command="{Binding PauseRootCommand}" />
+                                    <Button Content="重新扫描补齐" Style="{StaticResource ToolButton}" Margin="0,0,4,0" Command="{Binding RescanRootCommand}" />
+                                    <Button Content="取消扫描" Style="{StaticResource ToolButton}" Margin="0,0,4,0" Command="{Binding CancelScanCommand}" />
+                                    <Button Content="移除保护" Style="{StaticResource ToolDangerButton}" Command="{Binding RemoveRootCommand}" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <TextBlock Text="历史与磁盘（细粒度）" Style="{StaticResource SectionTitle}" Margin="0,8,0,4" />
+                        <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                            <StackPanel>
+                                <WrapPanel>
+                                    <StackPanel Margin="0,0,10,0">
+                                        <TextBlock Text="保留天数" Style="{StaticResource Caption}" />
+                                        <TextBox Width="70" Style="{StaticResource ToolBox}"
+                                                 Text="{Binding SettingRetentionDays, UpdateSourceTrigger=LostFocus}" />
+                                    </StackPanel>
+                                    <StackPanel Margin="0,0,10,0">
+                                        <TextBlock Text="占用上限 (GB)" Style="{StaticResource Caption}" />
+                                        <TextBox Width="70" Style="{StaticResource ToolBox}"
+                                                 Text="{Binding SettingMaxHistoryGb, UpdateSourceTrigger=LostFocus}" />
+                                    </StackPanel>
+                                    <StackPanel Margin="0,0,10,0">
+                                        <TextBlock Text="单文件上限 (MB)" Style="{StaticResource Caption}" />
+                                        <TextBox Width="70" Style="{StaticResource ToolBox}"
+                                                 Text="{Binding SettingMaxFileSizeMb, UpdateSourceTrigger=LostFocus}" />
+                                    </StackPanel>
+                                    <StackPanel>
+                                        <TextBlock Text="自动恢复点 (分钟,0=关)" Style="{StaticResource Caption}" />
+                                        <TextBox Width="80" Style="{StaticResource ToolBox}"
+                                                 Text="{Binding SettingAutoSnapshotMinutes, UpdateSourceTrigger=LostFocus}" />
+                                    </StackPanel>
+                                </WrapPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                    <Button Content="生成清理计划" Style="{StaticResource ToolButton}" Margin="0,0,4,0" Command="{Binding PlanCleanupCommand}" />
+                                    <Button Content="执行清理" Style="{StaticResource ToolDangerButton}" Margin="0,0,4,0" Command="{Binding ApplyCleanupCommand}" />
+                                    <Button Content="检查完整性" Style="{StaticResource ToolButton}" Command="{Binding CheckIntegrityCommand}" />
+                                </StackPanel>
+                                <TextBlock Text="{Binding CleanupPreview}" Style="{StaticResource Caption}" TextWrapping="Wrap" Margin="0,4,0,0"
+                                           Visibility="{Binding CleanupPreview, Converter={StaticResource NotNullVis}}" />
+                            </StackPanel>
+                        </Border>
+
+                        <TextBlock Text="记录行为" Style="{StaticResource SectionTitle}" Margin="0,8,0,4" />
+                        <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                            <StackPanel>
+                                <WrapPanel>
+                                    <StackPanel Margin="0,0,10,0">
+                                        <TextBlock Text="合并窗口 (毫秒)" Style="{StaticResource Caption}" />
+                                        <TextBox Width="80" Style="{StaticResource ToolBox}"
+                                                 Text="{Binding SettingMergeWindowMs, UpdateSourceTrigger=LostFocus}" />
+                                    </StackPanel>
+                                    <StackPanel>
+                                        <TextBlock Text="写入稳定等待 (毫秒)" Style="{StaticResource Caption}" />
+                                        <TextBox Width="80" Style="{StaticResource ToolBox}"
+                                                 Text="{Binding SettingSettleDelayMs, UpdateSourceTrigger=LostFocus}" />
+                                    </StackPanel>
+                                </WrapPanel>
+                                <TextBlock Text="排除的文件名（每行一个）" Style="{StaticResource Caption}" Margin="0,4,0,2" />
+                                <TextBox Height="52" Style="{StaticResource ToolBox}" AcceptsReturn="True"
+                                         VerticalScrollBarVisibility="Auto" FontFamily="{StaticResource MonoFont}"
+                                         Text="{Binding ExcludePatternsText, UpdateSourceTrigger=LostFocus}" />
+                                <TextBlock Text="排除的文件夹名（每行一个）" Style="{StaticResource Caption}" Margin="0,4,0,2" />
+                                <TextBox Height="52" Style="{StaticResource ToolBox}" AcceptsReturn="True"
+                                         VerticalScrollBarVisibility="Auto" FontFamily="{StaticResource MonoFont}"
+                                         Text="{Binding ExcludeDirectoriesText, UpdateSourceTrigger=LostFocus}" />
+                                <WrapPanel Margin="0,6,0,0">
+                                    <CheckBox Content="记录是哪个程序改的" IsChecked="{Binding SettingAttribution}" FontSize="11.5" Margin="0,0,12,0" />
+                                    <CheckBox Content="压缩文本内容" IsChecked="{Binding SettingCompression}" FontSize="11.5" Margin="0,0,12,0" />
+                                    <CheckBox Content="折叠瞬时变化" IsChecked="{Binding SettingCollapseTransient}" FontSize="11.5" Margin="0,0,12,0" />
+                                </WrapPanel>
+                                <Button Content="保存设置" Style="{StaticResource ToolPrimaryButton}" HorizontalAlignment="Left" Margin="0,6,0,0"
+                                        Command="{Binding SaveSettingsCommand}" />
+                            </StackPanel>
+                        </Border>
+
+                        <TextBlock Text="运行状态与说明" Style="{StaticResource SectionTitle}" Margin="0,8,0,4" />
+                        <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
+                            <StackPanel>
+                                <Button Content="打开运行日志" Style="{StaticResource ToolButton}" HorizontalAlignment="Left" Margin="0,0,0,4"
+                                        Command="{Binding ShowLogCommand}" />
+                                <ItemsControl ItemsSource="{Binding StartupNotes}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding}" Style="{StaticResource Caption}" TextWrapping="Wrap" FontSize="11" />
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </StackPanel>
+            </ListBox>
+
+            <!-- ────────── 运行日志（从设置进入） ────────── -->
+            <Grid Visibility="{Binding IsLogPage, Converter={StaticResource BoolVis}}" Margin="8,6,8,6">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <DockPanel Grid.Row="0" LastChildFill="False" Margin="0,0,0,4">
+                    <Button DockPanel.Dock="Left" Content="← 返回设置" Style="{StaticResource ToolButton}"
+                            Command="{Binding NavigateCommand}" CommandParameter="settings" />
+                    <TextBlock DockPanel.Dock="Left" Text="引擎的真实记录，排查问题时才需要看。"
+                               Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="6,0,0,0" />
+                </DockPanel>
+                <ListBox Grid.Row="1" Style="{StaticResource ToolList}" ItemsSource="{Binding Logs}">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="62" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="{Binding TimeText}" Style="{StaticResource Caption}"
+                                           FontFamily="{StaticResource MonoFont}" />
+                                <TextBlock Grid.Column="1" Text="{Binding Message}" FontSize="11.5" TextWrapping="Wrap"
+                                           Foreground="{Binding Tone, Converter={StaticResource ChangeTone}}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+        </Grid>
+
+        <!-- ══════════════ 状态栏 ══════════════ -->
+        <Border Grid.Row="3" Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="0,1,0,0"
+                Padding="8,3">
+            <DockPanel LastChildFill="False">
+                <TextBlock DockPanel.Dock="Right" Text="记录事实，不伪造因果。" Style="{StaticResource Caption}"
+                           Foreground="{StaticResource FgMuted}" />
+                <TextBlock Text="{Binding StatusBarLeftText}" Style="{StaticResource Caption}"
+                           TextTrimming="CharacterEllipsis" />
+            </DockPanel>
+        </Border>
+    </Grid>
+</Window>

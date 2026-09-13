@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    LastRegret.Runtime —— 应用运行时的"组装根"（composition root）。
+
+    为什么单独一个项目：
+      · 它要能被非 WPF 的宿主复用（未来的 CLI / MCP server 都要靠它把自己装起来）；
+      · 如果它留在 LastRegret.App（WinExe + UseWPF）里，任何别的宿主都得引用一个
+        WPF 可执行程序 —— 那是错误的方向。
+
+    为什么 TargetFramework 是 net8.0（而不是 App 的 net8.0-windows）：
+      与 Core / Data / Engine / Windows 四个层保持一致，并且**从编译层面保证**
+      它不可能引用 WPF —— net8.0 目标下没有 PresentationFramework /
+      PresentationCore / WindowsBase 可引用。这是比"约定不要用 WPF"更硬的保证。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>LastRegret.Runtime</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!-- Release 不产出 .pdb（上线前体检阻断项：调试符号会泄露源码路径与实现细节） -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LastRegret.Core\LastRegret.Core.csproj" />
+    <ProjectReference Include="..\LastRegret.Data\LastRegret.Data.csproj" />
+    <ProjectReference Include="..\LastRegret.Engine\LastRegret.Engine.csproj" />
+    <ProjectReference Include="..\LastRegret.Windows\LastRegret.Windows.csproj" />
+  </ItemGroup>
+
+</Project>

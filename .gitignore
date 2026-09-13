@@ -1,0 +1,44 @@
+# ── 构建产物与运行期数据 ──────────────────────────────────────────────
+bin/
+obj/
+.offline/
+LastRegretData/
+*.user
+*.suo
+.vs/
+
+# ── 发布产物 ─────────────────────────────────────────────────────────
+/dist/
+output/
+
+# ── 运行期数据（真实数据在 %LOCALAPPDATA%\LastRegret）────────────────
+data/runtime/
+*.db
+*.db-wal
+*.db-shm
+*.bak-v*
+
+# ── 测试与日志 ───────────────────────────────────────────────────────
+*.log
+data/logs/
+
+# ── 密钥与凭据（预防性条目，当前项目没有这类文件）────────────────────
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+secrets.json
+credentials.json
+appsettings.*.local.json
+
+# ── 内部开发记录与本地工具（保留在本地，不进公开仓库）────────────────
+.ai
+docs/验收记录.md
+上线前体检报告.md
+audit-preflight.md
+push-to-github.ps1
+push-github.cmd

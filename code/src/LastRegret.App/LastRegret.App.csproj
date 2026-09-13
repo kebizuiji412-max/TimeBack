@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>LastRegret.App</RootNamespace>
+    <AssemblyName>LastRegret</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 品牌：中文名「回溯」，英文名 TimeBack（资源管理器/任务管理器会显示 Product 与 FileDescription） -->
+    <Product>回溯 (TimeBack)</Product>
+    <AssemblyTitle>回溯</AssemblyTitle>
+    <Description>回溯 (TimeBack) —— Windows 本机文件状态时间机器：记录文件夹历史，可把文件恢复到过去的状态。</Description>
+    <Version>0.1.0</Version>
+    <!-- 应用图标：由 assets/icon/make-icon.ps1 生成（多尺寸 ico，内嵌 256/128/64/48/32/24/16） -->
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Platforms>AnyCPU;x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+  </PropertyGroup>
+
+  <!--
+    Release 不产出 .pdb 调试符号（上线前体检发现的阻断项）。
+    .pdb 含源码文件路径、行号与局部变量布局，配合反编译工具能把实现还原到接近源码；
+    这个程序要被装到用户本机并持有用户目录结构，不该把内部实现一起发出去。
+    Debug 构建仍然产出 pdb，否则本地调试没法用。
+  -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Window.Icon="app.ico" 需要它作为 WPF **Resource**（打进程序集资源），
+      而不是默认的 Content（只在输出目录里放一份）。
+      ApplicationIcon 用的是同一个文件，给 exe 嵌图标。
+    -->
+    <Resource Include="app.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      App 是 WPF 壳，运行时依赖者是 Runtime（装配根）。
+      它同时直接引用 Core / Data / Engine / Windows，因为 MainViewModel 直接用这些层的类型
+      （快照、计划、仓储、数据库…）。这里**故意写全**，而不是靠 Runtime 的传递引用 ——
+      传递引用会让"App 到底碰了哪几层"在图上看不出来。
+      方向仍然是单向的：App → Runtime → (Engine → Data → Windows → Core)，无循环。
+    -->
+    <ProjectReference Include="..\LastRegret.Runtime\LastRegret.Runtime.csproj" />
+    <ProjectReference Include="..\LastRegret.Core\LastRegret.Core.csproj" />
+    <ProjectReference Include="..\LastRegret.Data\LastRegret.Data.csproj" />
+    <ProjectReference Include="..\LastRegret.Engine\LastRegret.Engine.csproj" />
+    <ProjectReference Include="..\LastRegret.Windows\LastRegret.Windows.csproj" />
+  </ItemGroup>
+
+</Project>

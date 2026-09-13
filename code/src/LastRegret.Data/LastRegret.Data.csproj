@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>LastRegret.Data</RootNamespace>
+    <AssemblyName>LastRegret.Data</AssemblyName>
+  </PropertyGroup>
+
+  <!-- Release 不产出 .pdb（上线前体检阻断项：调试符号会泄露源码路径与实现细节） -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LastRegret.Core\LastRegret.Core.csproj" />
+    <ProjectReference Include="..\LastRegret.Windows\LastRegret.Windows.csproj" />
+  </ItemGroup>
+
+</Project>

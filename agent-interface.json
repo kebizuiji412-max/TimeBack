@@ -1,0 +1,46 @@
+{
+  "protocol": "timeback-agent",
+  "version": "1.0",
+  "status": "reserved",
+  "documentation": "docs/agent-protocol.md",
+
+  "product": {
+    "id": "timeback",
+    "name": "回溯 / TimeBack",
+    "version": "0.1.0",
+    "platform": "windows"
+  },
+
+  "capabilities": [
+    {
+      "id": "protected-folders.read",
+      "readonly": true,
+      "description": "读取当前受保护的文件夹清单：路径、是否正在监听、是否已建立基线。"
+    },
+    {
+      "id": "timeline.read",
+      "readonly": true,
+      "description": "读取某个受保护文件夹的恢复点（时间点）清单及其时间与规模信息。"
+    },
+    {
+      "id": "changes.read",
+      "readonly": true,
+      "description": "读取某个受保护文件夹的变化记录：哪个路径在什么时间发生了什么变化。"
+    },
+    {
+      "id": "restore.preview",
+      "readonly": true,
+      "description": "生成只读预览：恢复到某个时间点会创建、覆盖、删除哪些路径。不写磁盘、不改历史。"
+    },
+    {
+      "id": "restore.execute",
+      "readonly": false,
+      "description": "执行一份已经预览并确认过的恢复计划（可含删除）。会写磁盘，执行前自动建立安全点。"
+    },
+    {
+      "id": "restore.undo",
+      "readonly": false,
+      "description": "撤销一次实际存在且可撤销的恢复操作，把范围放回那次恢复之前的状态。"
+    }
+  ]
+}
