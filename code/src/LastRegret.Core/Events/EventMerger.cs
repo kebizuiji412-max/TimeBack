@@ -126,15 +126,31 @@ public sealed class EventMerger
         }
 
         // 2) 待确认事件
+        //
+        // ⚠ 真实缺陷（本轮修复，FINAL-WB-003）：
+        //   这里原先**只用"距最后一次写入的静默时间"**（SettleDelayMs）决定何时收束，
+        //   MergeWindowMs 这个设置项在合并逻辑里**根本没人读**（UI 里却能改），
+        //   于是它是个假设置。后果：只要写入节奏比 SettleDelayMs 更快，记录就永远不落库，
+        //   一轮一轮的真实编辑被无限累积成**一条**历史 ——
+        //   实测 300 次写入（每轮 A→B→C，轮间隔 200ms）最终只剩 12 条历史，
+        //   88/100 轮没有任何独立历史落点，用户无法按细粒度回溯。
+        //
+        //   现在的语义（见 AppSettings 里的产品语义说明）：
+        //     · 静默超过 SettleDelayMs        → 这一轮写完了，收束成一条历史；
+        //     · 距**本轮首次**写入超过 MergeWindowMs → 硬上限，必须收束（别再无止境合并）；
+        //     · 扩展次数/总时长到顶            → 强制收束（持续写入的文件不能永远不落库）。
+        //   这样"一次保存内部的多次写入"照样被压成一条，而两次相隔超过静默阈值的编辑
+        //   一定各自留下独立历史点。
         var due = new List<PendingKey>();
         foreach (var (key, pending) in _pending)
         {
-            var elapsed = (utcNow - pending.LastUtc).TotalMilliseconds;
-            var totalElapsed = (utcNow - pending.FirstUtc).TotalMilliseconds;
-            bool settled = elapsed >= _settings.SettleDelayMs;
+            var quietMs = (utcNow - pending.LastUtc).TotalMilliseconds;
+            var burstMs = (utcNow - pending.FirstUtc).TotalMilliseconds;
+            bool settled = quietMs >= _settings.SettleDelayMs;
+            bool windowClosed = burstMs >= _settings.MergeWindowMs;
             bool extended = pending.Extensions >= _settings.MaxMergeExtensions;
-            bool forced = totalElapsed >= _settings.MaxConfirmDelayMs;
-            if (settled || extended || forced) due.Add(key);
+            bool forced = burstMs >= _settings.MaxConfirmDelayMs;
+            if (settled || windowClosed || extended || forced) due.Add(key);
         }
 
         foreach (var key in due)
@@ -163,6 +179,18 @@ public sealed class EventMerger
         {
             if (_pending.Remove(key, out var pending)) Finalize(pending, utcNow);
         }
+
+        // ── 强制落库之后，去重表必须清空（本轮修复，FINAL-WB-003）──
+        //
+        // 去重表 `_recent` 的作用是压掉"操作系统对同一次改动重复投递的通知"，
+        // 它的判据是"同一路径 + 同一动作 + 120ms 内"。但这里有个致命的时间差：
+        //   · 用户保存时间点 / 恢复前 / 退出前都会强制 flush —— 那一刻的事实已经落库了；
+        //   · 紧接着（120ms 内）再次修改同一文件时，新通知会被当成**上一次的重复**
+        //     而整条丢弃 —— 于是"刚保存完就改"的那次变化**永久消失在历史里**。
+        // 强制落库意味着"上一批通知已经消费完毕"，此后到来的通知都是新事实，
+        // 拿它和已经落库的通知比"是不是重复"本身就不成立。
+        _recent.Clear();
+
         return DrainReady();
     }
 
@@ -259,7 +287,9 @@ public sealed class EventMerger
                 break;
 
             case RawChangeKind.RenamedNew:
-                OnRenamedNew(rootPath, raw, rel);
+                // oldRel 来自 raw.OldAbsolutePath：watcher 在同一批通知里已经配好的一对
+                // （同批 rename 只有这一条通知，不会再有单独的 RenamedOld）。
+                OnRenamedNew(rootPath, raw, rel, oldRel);
                 break;
         }
     }
@@ -401,28 +431,56 @@ public sealed class EventMerger
 
     // ── 重命名（新名到达）────────────────────────────────────────────────
 
-    private void OnRenamedNew(string rootPath, RawFsNotification raw, string newRel)
+    private void OnRenamedNew(string rootPath, RawFsNotification raw, string newRel, string? pairedOldRel)
     {
-        // 找配对的旧名（同根、时间窗内）
+        // ── 旧路径的**权威来源**：watcher 自己已经配好的 OldAbsolutePath ──
+        //
+        // ⚠ 真实缺陷（本轮修复，磁盘级测试暴露）：
+        //   同一次 ReadDirectoryChangesW 缓冲区里同时含 OLD/NEW 两个动作时，
+        //   `DirectoryWatcher.ParseBuffer` 会把它们**合并成一条**带 OldAbsolutePath 的
+        //   RenamedNew。而这里原先只查 `_renameOld`，那个字典仅在收到**单独的**
+        //   RenamedOld 通知时才会被填充 —— 于是同批 rename 永远配对失败，落到下面的
+        //   fallback 被记成 **Created**：磁盘上是"A 改名为 B"，历史里却是"多了一个 B"，
+        //   而 A 既不消失也不留下删除事实。
+        //   现在：watcher 配好的优先；`_renameOld` 只作为"OLD 与 NEW 跨批到达"的兜底。
         PendingKey? oldKey = null;
         RenameOld? old = null;
-        foreach (var (key, candidate) in _renameOld)
+
+        if (!string.IsNullOrEmpty(pairedOldRel))
         {
-            if (candidate.RootId != raw.RootId) continue;
-            if ((raw.TimestampUtc - candidate.At).TotalMilliseconds > _settings.RenamePairWindowMs) continue;
-            oldKey = key;
-            old = candidate;
-            break;
+            // watcher 已配对：直接采用；顺手清掉同名兜底项，避免之后被错配到别的路径
+            _renameOld.Remove(new PendingKey(raw.RootId, pairedOldRel, "rename-old", -1));
+            old = new RenameOld
+            {
+                RootId = raw.RootId,
+                RootPath = rootPath,
+                RelativePath = pairedOldRel,
+                IsDirectory = raw.IsDirectory,
+                At = raw.TimestampUtc,
+            };
+        }
+        else
+        {
+            // 跨批到达：在时间窗内找配对的旧名（同根、同类型优先）
+            foreach (var (key, candidate) in _renameOld)
+            {
+                if (candidate.RootId != raw.RootId) continue;
+                if ((raw.TimestampUtc - candidate.At).TotalMilliseconds > _settings.RenamePairWindowMs) continue;
+                oldKey = key;
+                old = candidate;
+                break;
+            }
+
+            if (old is null || oldKey is null)
+            {
+                // 没有配对上的旧名：只能如实记为"新增"（绝不臆造重命名）
+                OnAdded(rootPath, raw, newRel);
+                return;
+            }
+
+            _renameOld.Remove(oldKey.Value);
         }
 
-        if (old is null || oldKey is null)
-        {
-            // 没有配对上的旧名：只能如实记为"新增"（绝不臆造重命名）
-            OnAdded(rootPath, raw, newRel);
-            return;
-        }
-
-        _renameOld.Remove(oldKey.Value);
         var oldRel = old.RelativePath;
 
         // 取消旧路径上尚在待确认的"创建"（典型的原子替换临时文件）

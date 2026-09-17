@@ -241,15 +241,20 @@ public sealed class ContentStore : IContentStore, IDisposable
             }
 
             // 5) 写索引
-            long id;
+            long id = 0;
             var now = DateTime.UtcNow.Ticks;
             try
             {
-                _db.NonQuery(
-                    "INSERT INTO objects(hash, logical_size, stored_size, encoding, ext_hint, created_utc, ref_write_utc) " +
-                    "VALUES (?,?,?,?,?,?,?);",
-                    hash, logicalSize, storedSize, compress ? "deflate" : "raw", extensionHint, now, now);
-                id = _db.LastInsertRowId();
+                // ⚠ BB-005：INSERT 与取回自增 Id 放在同一事务里，
+                // 否则并发写入（监听线程与恢复线程同时存内容）时这里可能读到别人的 Id。
+                _db.InTransaction(() =>
+                {
+                    _db.NonQuery(
+                        "INSERT INTO objects(hash, logical_size, stored_size, encoding, ext_hint, created_utc, ref_write_utc) " +
+                        "VALUES (?,?,?,?,?,?,?);",
+                        hash, logicalSize, storedSize, compress ? "deflate" : "raw", extensionHint, now, now);
+                    id = _db.LastInsertRowId();
+                });
             }
             catch (SqliteException)
             {
@@ -443,9 +448,27 @@ public sealed class ContentStore : IContentStore, IDisposable
     // 还原到磁盘（恢复引擎的核心动作）
     // ─────────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// 把 CAS 里的对象内容写回磁盘上的目标路径（恢复引擎的核心动作）。
+    ///
+    /// 分三步，且**每一步的错误都如实归因**（本轮修复，FINAL-WB-002）：
+    ///   ① 取对象元数据 → 写临时文件（同目录，保证同卷）；
+    ///   ② 校验写出的内容哈希（防磁盘故障导致的静默损坏）；
+    ///   ③ 原位替换目标。
+    ///
+    /// ⚠ 真实缺陷：原实现把所有失败都压成一句 <c>读取失败：{ex.Message}</c>，
+    ///   于是"替换目标失败"（例如目标带加密/只读等属性导致替换不被允许）也被说成
+    ///   **"读取失败：无法加密指定的文件 … text.txt.lrtmp-*"** —— 错误信息指向了错误的对象、
+    ///   也指向了错误的动作，让人以为是读目标文件失败。现在按阶段分别说明。
+    /// ⚠ 另一个真实缺陷：失败时**不清理临时文件**（原实现只有"校验失败"与
+    ///   <c>ReplaceFile</c> 的 IOException 分支清理），会在用户目录里留下 <c>.lrtmp-*</c> 残留。
+    ///   现在无论在哪一步失败都清理，绝不在用户目录里留垃圾。
+    /// </summary>
     public bool TryMaterialize(long objectId, string targetAbsolutePath, out string? error)
     {
         error = null;
+        string? tempPath = null;
+        string? tempExtended = null;
         try
         {
             var obj = FindById(objectId);
@@ -454,37 +477,56 @@ public sealed class ContentStore : IContentStore, IDisposable
             var objectPath = ObjectPath(obj.Hash);
             if (!File.Exists(objectPath)) { error = "内容文件已丢失（可能已被历史清理）"; return false; }
 
-            var target = Io.FileSystemReader.Extend(targetAbsolutePath);
             var dir = Path.GetDirectoryName(targetAbsolutePath);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(Io.FileSystemReader.Extend(dir));
 
-            // 原子写：临时文件 + 替换。同目录内保证同卷，File.Move 才是原子的。
-            var tempPath = targetAbsolutePath + $".lrtmp-{Guid.NewGuid():N}";
-            var tempExtended = Io.FileSystemReader.Extend(tempPath);
-
-            if (obj.Encoding == "deflate")
+            // ① 原子写：临时文件 + 替换。同目录内保证同卷，移动才是原子的。
+            tempPath = targetAbsolutePath + $".lrtmp-{Guid.NewGuid():N}";
+            tempExtended = Io.FileSystemReader.Extend(tempPath);
+            try
             {
-                using var fs = new FileStream(objectPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                using var deflate = new ZLibStream(fs, CompressionMode.Decompress);
-                using var dst = new FileStream(tempExtended, FileMode.CreateNew, FileAccess.Write, FileShare.None, 256 * 1024, FileOptions.WriteThrough);
-                deflate.CopyTo(dst, 256 * 1024);
-                dst.Flush(flushToDisk: true);
+                MaterializeToTemp(obj, objectPath, tempExtended);
             }
-            else
+            catch (Exception ex)
             {
-                File.Copy(objectPath, tempExtended, overwrite: false);
+                error = "读取历史内容失败：" + Io.FileSystemReader.Describe(ex);
+                return false;
             }
 
-            // 校验写出的内容（防止磁盘故障导致的静默损坏）
+            // ② 校验写出的内容（防止磁盘故障导致的静默损坏）
             var writtenHash = HashFile(tempExtended, compressed: false);
             if (!string.Equals(writtenHash, obj.Hash, StringComparison.OrdinalIgnoreCase))
             {
-                TryDelete(tempExtended);
                 error = $"还原后校验失败（期望 {obj.Hash[..12]}…，实际 {writtenHash[..12]}…），已放弃本次写入";
                 return false;
             }
 
-            ReplaceFile(tempExtended, targetAbsolutePath);
+            // ③ 原位替换。目标存在时用 File.Replace（保留目标文件的属性/安全描述符），
+            //    否则用 File.Move（新建）。两者都会把内容原子地换过去，绝不"先删后写"。
+            //
+            //    替换前**兜底清掉加密标记**：即便将来有别的路径把 FILE_ATTRIBUTE_ENCRYPTED
+            //    带到了临时文件上，也不能让"还原一个普通文本文件"因为它而失败（FINAL-WB-002）。
+            //    清不掉也不在这里阻断 —— 真正的正确性由下面的替换结果与调用方校验负责。
+            var tempAttrs = File.GetAttributes(tempExtended);
+            if ((tempAttrs & FileAttributes.Encrypted) != 0)
+            {
+                try { File.SetAttributes(tempExtended, tempAttrs & ~FileAttributes.Encrypted); }
+                catch (Exception) { /* 清不掉就原样继续，不制造新的失败点 */ }
+            }
+
+            var targetExtended = Io.FileSystemReader.Extend(targetAbsolutePath);
+            try
+            {
+                if (File.Exists(targetExtended)) File.Replace(tempExtended, targetExtended, null);
+                else File.Move(tempExtended, targetExtended, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                error = $"替换目标文件失败（{Io.FileSystemReader.Describe(ex)}）。已保留原文件，未做任何覆盖。";
+                return false;
+            }
+
+            tempPath = null;    // 已成功改名，不需要再清理
             return true;
         }
         catch (Exception ex)
@@ -492,25 +534,44 @@ public sealed class ContentStore : IContentStore, IDisposable
             error = Io.FileSystemReader.Describe(ex);
             return false;
         }
+        finally
+        {
+            // 只要临时文件还在，就说明这次写入没有成功落地 —— 一律清理，不留残留
+            if (tempPath is not null) TryDelete(tempExtended ?? tempPath);
+        }
     }
 
-    /// <summary>原子替换目标文件。目标被占用时如实失败，绝不"先删后写"造成数据丢失。</summary>
-    private static void ReplaceFile(string tempExtendedPath, string targetAbsolutePath)
+    /// <summary>
+    /// 把对象内容（可能 deflate 压缩）写到临时文件。
+    ///
+    /// ⚠ 真实缺陷（本轮修复，FINAL-WB-002 —— "合法 restore 完全失败"）：
+    ///   原实现对小文件走 <c>File.Copy(objectPath, tempExtended)</c>。
+    ///   而 **File.Copy 会把源文件的属性一起复制到目标**，包括
+    ///   <c>FILE_ATTRIBUTE_ENCRYPTED</c>（EFS 加密标记）——
+    ///   内容库里的对象一旦带上这个标记（应用数据目录在 C: 且被标记为加密新文件时就会继承），
+    ///   还原时那个写向目标目录的 <c>&lt;名字&gt;.lrtmp-*</c> 临时文件就会被系统要求加密，
+    ///   在 EFS 不可用的机器上直接失败：**"无法加密指定的文件 … text.txt.lrtmp-*"**。
+    ///   这不是"读历史内容失败"，而是"复制把加密属性带过去了"。
+    ///
+    ///   现在一律用**字节流复制**：只搬内容，不搬属性 ——
+    ///   临时文件的属性由它所在的（用户目标）目录决定，跨卷同卷都一样安全。
+    /// </summary>
+    private static void MaterializeToTemp(StoredObject obj, string objectPath, string tempExtended)
     {
-        if (File.Exists(Io.FileSystemReader.Extend(targetAbsolutePath)))
+        using var src = new FileStream(objectPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var dst = new FileStream(tempExtended, FileMode.CreateNew, FileAccess.Write, FileShare.None, 256 * 1024, FileOptions.WriteThrough);
+
+        if (obj.Encoding == "deflate")
         {
-            try
-            {
-                File.Move(tempExtendedPath, Io.FileSystemReader.Extend(targetAbsolutePath), overwrite: true);
-                return;
-            }
-            catch (IOException)
-            {
-                TryDelete(tempExtendedPath);
-                throw;
-            }
+            using var deflate = new ZLibStream(src, CompressionMode.Decompress);
+            deflate.CopyTo(dst, 256 * 1024);
         }
-        File.Move(tempExtendedPath, Io.FileSystemReader.Extend(targetAbsolutePath), overwrite: true);
+        else
+        {
+            src.CopyTo(dst, 256 * 1024);
+        }
+
+        dst.Flush(flushToDisk: true);
     }
 
     private static void TryDelete(string path)

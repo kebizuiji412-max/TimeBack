@@ -47,17 +47,17 @@ public sealed class Sandbox : IDisposable
     public long RootId { get; private set; }
     public WatchedRoot WatchedRoot { get; private set; } = new();
 
-    public static Sandbox Create(string name)
+    public static Sandbox Create(string name, bool enableProcessAttribution = false)
     {
         var root = Path.Combine(Path.GetTempPath(), "lastregret-tests", $"{name}-{Guid.NewGuid():N}"[..(name.Length + 12)]);
         var watch = Path.Combine(root, "watched");
         var data = Path.Combine(root, "data");
         Directory.CreateDirectory(watch);
         Directory.CreateDirectory(data);
-        return new Sandbox(root, watch, data);
+        return new Sandbox(root, watch, data, enableProcessAttribution);
     }
 
-    private Sandbox(string root, string watchDir, string dataDir)
+    private Sandbox(string root, string watchDir, string dataDir, bool enableProcessAttribution = false)
     {
         Root = root;
         WatchDir = watchDir;
@@ -75,7 +75,7 @@ public sealed class Sandbox : IDisposable
             MaxMergeExtensions = 4,
             AutoSnapshotIntervalMinutes = 0,   // 测试里不自动快照，改为显式创建
             EnableCompression = true,
-            EnableProcessAttribution = false,  // 归属需要枚举全系统句柄，测试里关掉以保证速度与稳定
+            EnableProcessAttribution = enableProcessAttribution,  // 默认关（枚举全系统句柄很慢）；F-02 用例会显式打开
             MaxStoreFileSizeBytes = 8 * 1024 * 1024,
         };
 

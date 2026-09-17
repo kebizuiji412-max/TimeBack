@@ -345,7 +345,7 @@ public sealed class Rescanner
                     {
                         report.DetectedCreated++;
                         pendingEvents.Add(MakeEvent(root.Id, BaselineSourceOrResync(mode), OperationType.Created,
-                            EntryKind.Directory, rel, abs, size, mtime, readOnly, null, 0,
+                            EntryKind.Directory, rel, abs, size, mtime, readOnly, null, null,
                             "重新扫描发现该目录已存在"));
                     }
                 }
@@ -361,6 +361,9 @@ public sealed class Rescanner
 
                     string? hash = existing?.Hash;
                     long? objectId = existing?.ObjectId;
+
+                    // 重新计算之前先记下"变化前"的内容对象（只有它才是上一次记录的那一份）
+                    var previousObjectId = existing?.ObjectId;
 
                     if (needHash)
                     {
@@ -396,15 +399,16 @@ public sealed class Rescanner
                         {
                             report.DetectedCreated++;
                             pendingEvents.Add(MakeEvent(root.Id, ResyncSource, OperationType.Created, EntryKind.File,
-                                rel, abs, size, mtime, readOnly, hash, 0,
+                                rel, abs, size, mtime, readOnly, hash, objectId,
                                 "重新扫描发现该文件在程序未运行期间出现"));
                         }
                         else if (!string.Equals(existing.Hash, hash, StringComparison.OrdinalIgnoreCase))
                         {
                             report.DetectedModified++;
                             pendingEvents.Add(MakeEvent(root.Id, ResyncSource, OperationType.Modified, EntryKind.File,
-                                rel, abs, size, mtime, readOnly, hash, 0,
-                                "重新扫描发现内容与上次记录不一致（程序未运行期间的变化）"));
+                                rel, abs, size, mtime, readOnly, hash, objectId,
+                                "重新扫描发现内容与上次记录不一致（程序未运行期间的变化）",
+                                objectIdBefore: previousObjectId));
                         }
                     }
                 }
@@ -527,7 +531,7 @@ public sealed class Rescanner
     private static FileEvent MakeEvent(
         long rootId, string source, OperationType op, EntryKind kind,
         string relativePath, string absolutePath, long size, DateTime? mtime, bool readOnly,
-        string? hash, long objectId, string note)
+        string? hash, long? objectId, string note, long? objectIdBefore = null)
     {
         var ts = mtime ?? DateTime.UtcNow;
         return new FileEvent
@@ -540,6 +544,14 @@ public sealed class Rescanner
             RelativePath = relativePath,
             SizeAfter = size,
             HashAfter = hash,
+            // ⚠ BB-009：内容对象引用必须带上。
+            //   旧实现收了 objectId 形参却**从未写进事件**，调用点还传的是 0，
+            //   于是重扫产生的每个版本行都没有对象引用 →
+            //   文件详情里这些版本被一律标成「内容已被清理（不可恢复）」，
+            //   而内容其实就在内容库里、恢复也确实能做得到（只是这一层说自己做不到）。
+            //   没有留存内容时必须是 **null**（不可恢复），绝不能是 0 或任何伪造值。
+            ObjectIdAfter = objectId,
+            ObjectIdBefore = objectIdBefore,
             MtimeAfterUtc = mtime,
             Source = source,
             IsCoalesced = true,

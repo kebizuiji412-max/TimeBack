@@ -129,10 +129,28 @@ public sealed class SnapshotService
                 var entry = _index.Get(rootId, path);
                 if (entry is null || entry.IsDeleted)
                 {
+                    // 删除侧：只登记这个路径本身；**整棵子树**由清单层的"前缀删除"负责
+                    // （见 SnapshotRepository.InsertIncremental —— 目录被删/改名时，
+                    //   事件层只给得出父目录一个路径，子项必须按前缀一并移除，
+                    //   否则父快照复制下来的旧行会变成永远不消失的幽灵行）。
                     removed.Add(path);
                     continue;
                 }
+
                 upserts.Add(ToSnapshotFile(entry));
+
+                // 新增侧：目录级变化（新建目录 / 目录改名后的新路径）必须带上它当前的
+                // 整棵子树 —— 这些子项未必各自产生过事件（改名时只有父目录一条），
+                // 不加进来新快照就会"缺行"，让恢复误判为"这些子项该被删掉"。
+                if (entry.Kind == EntryKind.Directory)
+                {
+                    foreach (var child in _index.ListUnder(rootId, path))
+                    {
+                        if (PathUtil.Comparer.Equals(child.RelativePath, path)) continue;
+                        if (child.IsDeleted) continue;
+                        upserts.Add(ToSnapshotFile(child));
+                    }
+                }
             }
 
             // ── 兜底（真实缺陷，由测试暴露）──
@@ -198,32 +216,27 @@ public sealed class SnapshotService
     /// <summary>
     /// 把快照清单中的状态登记为"文件历史版本"。
     /// 这既是文件详情页的数据来源，也保证了"同一内容不会重复登记"。
+    ///
+    /// 判定交给数据库**一次批量完成**（<see cref="IFileVersionRepository.FindFilesNeedingVersion"/>）：
+    /// 它只返回"该路径最新历史版本与本次快照 hash 不同"的文件。
+    /// 旧写法是对每个文件各发一次 <c>GetLatestBefore</c>，在几万文件规模下是 N+1 查询瓶颈。
     /// </summary>
     private void RecordVersions(long rootId, Snapshot snapshot, SnapshotKind kind)
     {
-        // 只需要登记"这次快照里第一次出现的内容"，避免版本表爆炸
-        var existingHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        long lastEventId = snapshot.EventHighWatermark;
+        // 1) 一次 SQL：找出真正需要登记的文件（没有历史版本，或最新历史 hash 与当前不同）
+        var needing = _versions.FindFilesNeedingVersion(rootId, snapshot.Id, snapshot.TimestampUtc);
+        if (needing.Count == 0) return;
 
-        var files = _snapshots.LoadFiles(snapshot.Id);
-        var toInsert = new List<FileVersion>();
-
-        foreach (var f in files)
+        // 2) 组装版本行（字段与旧实现逐字一致）
+        var toInsert = new List<FileVersion>(needing.Count);
+        foreach (var f in needing)
         {
-            if (f.Kind != EntryKind.File || f.Hash is null) continue;
-
-            // 该路径在本次快照之前是否已有相同哈希的版本？
-            var latest = _versions.GetLatestBefore(rootId, f.RelativePath, snapshot.TimestampUtc);
-            if (latest is not null && string.Equals(latest.Hash, f.Hash, StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
             toInsert.Add(new FileVersion
             {
                 RootId = rootId,
                 RelativePath = f.RelativePath,
-                Hash = f.Hash,
+                // 批量查询里已经过滤 hash IS NOT NULL，所以这里一定不是 null
+                Hash = f.Hash!,
                 ObjectId = f.ObjectId,
                 Size = f.Size,
                 RecordedUtc = snapshot.TimestampUtc,
@@ -234,9 +247,8 @@ public sealed class SnapshotService
             });
         }
 
-        if (toInsert.Count > 0) _versions.InsertRange(toInsert);
-        _ = existingHashes;
-        _ = lastEventId;
+        // 3) 一次事务写入
+        _versions.InsertRange(toInsert);
     }
 
     /// <summary>取某时刻（含）之前最近的快照；没有快照时返回 null。</summary>

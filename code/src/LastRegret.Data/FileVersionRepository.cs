@@ -65,6 +65,44 @@ public sealed class FileVersionRepository : IFileVersionRepository
         return version;
     }
 
+    /// <summary>
+    /// 批量找出"需要新增历史版本"的快照文件——**一次 SQL 完成**，
+    /// 取代"每个文件调用一次 <see cref="GetLatestBefore"/> 的 N+1 查询。
+    ///
+    /// 判定与旧实现逐字等价：对快照里每个文件，取该 root + path_key 在
+    /// <paramref name="atUtc"/>（含该时刻）之前**最新**的一条历史版本：
+    ///   · 不存在           → 需要登记
+    ///   · 存在但 hash 不同 → 需要登记（含 A→B→A 这种"回到旧内容"的情况）
+    ///   · 存在且 hash 相同 → 跳过
+    ///
+    /// 相关子查询走现有索引 ix_versions_path(root_id, path_key, recorded_utc DESC)，
+    /// 所以整条语句只执行一次，往返次数与快照文件数无关。
+    /// </summary>
+    public IReadOnlyList<SnapshotFile> FindFilesNeedingVersion(long rootId, long snapshotId, DateTime atUtc)
+    {
+        var list = new List<SnapshotFile>();
+        _db.Query(
+            "SELECT sf.path, sf.size, sf.hash, sf.object_id, sf.mtime_utc " +
+            "FROM snapshot_files sf " +
+            "WHERE sf.snapshot_id = ? AND sf.kind = 'file' AND sf.hash IS NOT NULL " +
+            "  AND lower(COALESCE((SELECT v.hash FROM file_versions v " +
+            "                       WHERE v.root_id = ? AND v.path_key = sf.path_key AND v.recorded_utc <= ? " +
+            "                       ORDER BY v.recorded_utc DESC LIMIT 1), '')) <> lower(sf.hash) " +
+            "ORDER BY sf.path_key;",
+            new object?[] { snapshotId, rootId, SqliteConnection.ToUnixTicks(atUtc) },
+            row => list.Add(new SnapshotFile
+            {
+                SnapshotId = snapshotId,
+                RelativePath = row.GetString("path"),
+                Kind = EntryKind.File,
+                Size = row.GetInt64("size"),
+                Hash = row.GetString("hash"),
+                ObjectId = row.GetInt64OrNull("object_id"),
+                MtimeUtc = row.GetDateTimeUtcOrNull("mtime_utc"),
+            }));
+        return list;
+    }
+
     public FileVersion? GetById(long id)
     {
         FileVersion? version = null;

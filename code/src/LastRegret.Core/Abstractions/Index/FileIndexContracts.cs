@@ -30,6 +30,14 @@ public interface IFileIndex
     /// <summary>列出根下的全部当前条目（用于构建清单）。</summary>
     IReadOnlyList<IndexEntry> ListAll(long rootId);
 
+    /// <summary>
+    /// 列出某条路径及其子树的**当前有效**条目（不含已删除项，包含该路径自身）。
+    ///
+    /// 快照增量构建需要它：目录级事件（新建目录 / 目录改名）只会给出父目录一个路径，
+    /// 但清单里必须带上它当前的整棵子树，否则子项会缺失。
+    /// </summary>
+    IReadOnlyList<IndexEntry> ListUnder(long rootId, string prefix);
+
     /// <summary>当前索引中的条目总数。</summary>
     long CountAll(long rootId);
 

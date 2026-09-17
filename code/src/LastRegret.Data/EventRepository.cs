@@ -47,8 +47,15 @@ FROM events
 
     public long Append(FileEvent e)
     {
-        _db.NonQuery(InsertSql, ToArgs(e));
-        e.Id = _db.LastInsertRowId();
+        // ⚠ BB-005：INSERT 与"取回自增 Id"必须原子。
+        // 两步之间若被别的线程插入了一行，LastInsertRowId 会读到**别人的** Id
+        // （例如监听线程正在写事件、而主线程在读回恢复记录 Id）。
+        // 批量路径 AppendRange 本来就在事务里，这里对齐同一纪律。
+        _db.InTransaction(() =>
+        {
+            _db.NonQuery(InsertSql, ToArgs(e));
+            e.Id = _db.LastInsertRowId();
+        });
         return e.Id;
     }
 

@@ -236,7 +236,13 @@
                                     <Border Background="{StaticResource BgPanelAlt}" BorderBrush="{StaticResource Accent}"
                                             BorderThickness="1" MinWidth="{TemplateBinding ActualWidth}"
                                             MaxHeight="{TemplateBinding MaxDropDownHeight}">
-                                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                        <!--
+                                            下拉列表同样**不画滚动条**：Hidden 只影响外观，
+                                            滚轮照常滚动、方向键照常导航。
+                                            （这里原来是 Auto —— 时间点下拉条目一多，
+                                             右边就冒出一根长滑块，与整个界面的风格不一致。）
+                                        -->
+                                        <ScrollViewer VerticalScrollBarVisibility="Hidden">
                                             <ItemsPresenter />
                                         </ScrollViewer>
                                     </Border>
@@ -427,6 +433,8 @@
                 <Setter Property="BorderThickness" Value="0" />
                 <Setter Property="Foreground" Value="{StaticResource FgPrimary}" />
                 <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled" />
+                <!-- 兜底：任何没显式套 ToolList 的列表，也不得冒出滚动条（统一用滚轮） -->
+                <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Hidden" />
                 <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True" />
                 <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling" />
             </Style>

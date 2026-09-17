@@ -112,7 +112,15 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?);
             //    ⚠ 踩坑记录（PIT）：临时表 _manifest_stage 的 kind 等列声明为 NOT NULL，
             //    而这里只需要"路径"这一列。曾试图只插入 (path, path_key)，
             //    结果触发 NOT NULL 约束失败，整条增量快照链路直接崩掉。
-            //    现在只插入 path 并显式给出 kind，过滤时按 path 列比较。
+            //    现在只插入 path 并显式给出 kind，过滤时按 path_key 列比较。
+            //
+            //    ⚠ 另一条真实缺陷（幽灵行，本轮修复）：**必须做前缀删除**。
+            //    目录被整体删除（或改名）时，事件层只落得出一条父目录事件，
+            //    但磁盘上它下面的子项全都不存在了。只按"精确路径"删，
+            //    从父快照整体复制下来的 D/a.txt、D/sub/c.txt 会**原地残留**，
+            //    并顺着快照链一路传播 —— 恢复预览据此认为"这些文件还在"。
+            //    用 SUBSTR 精确比较前缀（不用 LIKE），避免把路径里的 % 和 _
+            //    当成通配符而误删无关行。
             if (removeList.Count > 0)
             {
                 _db.NonQuery("DELETE FROM _manifest_stage;");
@@ -123,7 +131,11 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?);
                         path, path.ToLowerInvariant());
                 }
                 _db.NonQuery(
-                    "DELETE FROM snapshot_files WHERE snapshot_id = ? AND path IN (SELECT path FROM _manifest_stage);",
+                    "DELETE FROM snapshot_files WHERE snapshot_id = ? AND EXISTS (" +
+                    "  SELECT 1 FROM _manifest_stage s WHERE " +
+                    "    snapshot_files.path_key = s.path_key OR (" +
+                    "      LENGTH(snapshot_files.path_key) > LENGTH(s.path_key) " +
+                    "      AND SUBSTR(snapshot_files.path_key, 1, LENGTH(s.path_key) + 1) = s.path_key || '/'))",
                     id);
             }
 
@@ -261,13 +273,29 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?);
         return snapshot;
     }
 
-    public IReadOnlyList<Snapshot> List(long rootId, int limit = 200)
+    public IReadOnlyList<Snapshot> List(long rootId, int limit = 200, DateTime? fromUtc = null, DateTime? toUtc = null)
     {
+        // 时间范围必须写在 SQL 里：先 LIMIT 再内存过滤会让较早的时间段被 limit 截断而查不到
+        // （真实缺陷 BB-008）。这里的边界与时间线语义一致：包含 from、包含 to。
+        var where = "root_id = ?";
+        var args = new List<object?> { rootId };
+        if (fromUtc is not null)
+        {
+            where += " AND ts_utc >= ?";
+            args.Add(SqliteConnection.ToUnixTicks(fromUtc.Value));
+        }
+        if (toUtc is not null)
+        {
+            where += " AND ts_utc <= ?";
+            args.Add(SqliteConnection.ToUnixTicks(toUtc.Value));
+        }
+        args.Add(limit);
+
         var list = new List<Snapshot>();
         _db.Query(
             "SELECT id, root_id, ts_utc, ts_local, kind, parent_id, event_high_watermark, file_count, dir_count, total_bytes, is_complete, note " +
-            "FROM snapshots WHERE root_id = ? ORDER BY ts_utc DESC, id DESC LIMIT ?;",
-            new object?[] { rootId, limit },
+            $"FROM snapshots WHERE {where} ORDER BY ts_utc DESC, id DESC LIMIT ?;",
+            args.ToArray(),
             row => list.Add(Map(row)));
         return list;
     }

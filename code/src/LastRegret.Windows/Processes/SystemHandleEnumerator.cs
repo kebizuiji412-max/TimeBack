@@ -29,11 +29,99 @@ internal static class SystemHandleEnumerator
     private const int MaxBufferBytes = 256 * 1024 * 1024;
     private const int QueryObjectTimeoutMs = 1200;
 
+    /// <summary>
+    /// 句柄快照的缓存有效期（毫秒）。
+    ///
+    /// ⚠ 真实缺陷（本轮修复，低配置性能事故的主因之一）：
+    ///   一次枚举要 0.2 秒以上、十几到二十几万条记录，而调用方是**按事件**来问的
+    ///   （批量修改 5000 个文件就是 5000 次）。加上每次解析对象名都新建线程，
+    ///   结果就是线程数随事件数失控、CPU 被打满、几十分钟跑不完。
+    ///   这里做短 TTL 缓存：同一批事件复用同一份快照。
+    ///   取 1.5 秒是折中 —— 归属本来就是"尽力而为"的辅助证据，稍旧完全可以接受；
+    ///   正常使用每秒只有零星几个事件，缓存几乎不影响新鲜度。
+    /// </summary>
+    private const int CaptureTtlMs = 1500;
+
+    private static readonly object CaptureGate = new();
+    private static IReadOnlyList<SystemHandleEntry>? _cached;
+    private static long _cachedAtMs;
+
     [DllImport("kernel32.dll")]
     private static extern IntPtr LocalFree(IntPtr hMem);
 
-    /// <summary>枚举全部系统句柄。</summary>
+    /// <summary>枚举全部系统句柄（带短 TTL 缓存，见 <see cref="CaptureTtlMs"/>）。</summary>
     public static bool TryCapture(out IReadOnlyList<SystemHandleEntry> entries)
+    {
+        lock (CaptureGate)
+        {
+            if (_cached is not null && Environment.TickCount64 - _cachedAtMs < CaptureTtlMs)
+            {
+                entries = _cached;
+                return true;
+            }
+        }
+
+        if (!TryCaptureFresh(out var fresh))
+        {
+            entries = Array.Empty<SystemHandleEntry>();
+            return false;
+        }
+
+        lock (CaptureGate)
+        {
+            _cached = fresh;
+            _cachedAtMs = Environment.TickCount64;
+        }
+        entries = fresh;
+        return true;
+    }
+
+    private static readonly object FileIndexGate = new();
+    private static IReadOnlyDictionary<int, List<SystemHandleEntry>>? _fileHandlesByPid;
+    private static ushort _fileHandlesTypeIndex;
+    private static long _fileHandlesAtMs;
+
+    /// <summary>
+    /// 取某个进程持有的**文件类型**句柄（用上面那份缓存快照按进程号建索引，建一次复用 1.5 秒）。
+    ///
+    /// 为什么需要它：旧调用方是"候选进程 × 全部系统句柄"的双层循环 —— 本机句柄表有二十多万条，
+    /// 每个事件都要扫一遍。改成按进程号预先分桶之后，每次事件只需要看候选进程自己那几条句柄，
+    /// 成本从"每个事件几百万次比较"降到"几十次"，而**能力一点没减**（该试的候选照样试）。
+    /// </summary>
+    public static IReadOnlyList<SystemHandleEntry> FileHandlesOf(int pid, ushort fileTypeIndex)
+    {
+        lock (FileIndexGate)
+        {
+            if (_fileHandlesByPid is null ||
+                _fileHandlesTypeIndex != fileTypeIndex ||
+                Environment.TickCount64 - _fileHandlesAtMs >= CaptureTtlMs)
+            {
+                if (!TryCapture(out var entries)) return Array.Empty<SystemHandleEntry>();
+
+                var map = new Dictionary<int, List<SystemHandleEntry>>();
+                foreach (var e in entries)
+                {
+                    if (e.ObjectTypeIndex != fileTypeIndex) continue;
+                    if (!map.TryGetValue(e.ProcessId, out var list))
+                    {
+                        map[e.ProcessId] = list = new List<SystemHandleEntry>(4);
+                    }
+                    list.Add(e);
+                }
+
+                _fileHandlesByPid = map;
+                _fileHandlesTypeIndex = fileTypeIndex;
+                _fileHandlesAtMs = Environment.TickCount64;
+            }
+
+            return _fileHandlesByPid.TryGetValue(pid, out var found)
+                ? found
+                : Array.Empty<SystemHandleEntry>();
+        }
+    }
+
+    /// <summary>真正做一次枚举（不带缓存）。</summary>
+    private static bool TryCaptureFresh(out IReadOnlyList<SystemHandleEntry> entries)
     {
         entries = Array.Empty<SystemHandleEntry>();
 
@@ -142,43 +230,106 @@ internal static class SystemHandleEnumerator
         }
     }
 
-    /// <summary>把一个句柄解析为对象名（文件句柄即设备路径）。带超时保护。</summary>
+    /// <summary>
+    /// 把一个句柄解析为对象名（文件句柄即设备路径）。
+    ///
+    /// ⚠ 真实缺陷（本轮修复）：
+    ///   旧实现**每次调用都新建一个线程**去跑 NtQueryObject，超时（1.2 秒）就把它丢掉。
+    ///   NtQueryObject 对某些对象会永久阻塞，于是被丢掉的那些线程永远出不来：
+    ///   批量事件下线程数一路涨到上千、结束后也不回落（实测 5000 个文件 → 峰值 1602 线程、
+    ///   结束后仍残留 1584）。另外超时后调用方会释放缓冲区，而那个被丢掉的线程可能还在写它
+    ///   —— 潜在的 use-after-free。
+    ///
+    /// 现在：**唯一的专职线程** + **有界队列** + **熔断**。
+    ///   · 线程只有一个，永远不新增、也永远不会被"丢掉"；
+    ///   · 队列满了就直接放弃（归属本来就只是尽力而为的证据），绝不排队堆积；
+    ///   · 一旦出现超时，说明本机存在会永久阻塞的对象 → 打开熔断一段时间，
+    ///     期间直接返回 null，把这台机器上"拿不到内核级证据"这件事如实降级，
+    ///     而不是继续白烧 CPU 和线程。
+    /// </summary>
     public static string? QueryObjectName(IntPtr handle)
     {
-        IntPtr buffer = IntPtr.Zero;
-        string? result = null;
-        try
-        {
-            buffer = Marshal.AllocHGlobal(16 * 1024);
-            int length;
-            int status = 0;
+        // 熔断中：直接放弃，不做任何尝试
+        if (Environment.TickCount64 < Volatile.Read(ref _circuitOpenUntilMs)) return null;
 
-            // NtQueryObject 对管道/同步对象可能永久阻塞 → 放到独立线程并设超时
-            var worker = new Thread(() =>
-            {
-                status = Win32.NtQueryObject(handle, Win32.ObjectNameInformation, buffer, 16 * 1024, out length);
-            })
+        var request = new QueryRequest { Handle = handle };
+        EnsureQueryWorker();
+
+        if (!QueryQueue.TryAdd(request)) return null;          // 队列满 → 放弃
+
+        if (!request.Done.Wait(QueryObjectTimeoutMs))
+        {
+            // 超时：worker 可能永久卡在这次调用里。不释放任何属于它的资源，
+            // 只把熔断打开，避免后续每个事件都再赔上 1.2 秒。
+            Volatile.Write(ref _circuitOpenUntilMs, Environment.TickCount64 + CircuitBreakMs);
+            return null;
+        }
+
+        return request.Result;
+    }
+
+    /// <summary>熔断持续时间：出现超时后这段时间内不再尝试解析对象名。</summary>
+    private const int CircuitBreakMs = 30_000;
+
+    private static readonly System.Collections.Concurrent.BlockingCollection<QueryRequest> QueryQueue =
+        new(new System.Collections.Concurrent.ConcurrentQueue<QueryRequest>(), 4);
+
+    private static readonly object WorkerGate = new();
+    private static Thread? _queryWorker;
+    private static long _circuitOpenUntilMs;
+
+    private sealed class QueryRequest
+    {
+        public IntPtr Handle;
+        public string? Result;
+        public readonly ManualResetEventSlim Done = new(false);
+    }
+
+    private static void EnsureQueryWorker()
+    {
+        if (_queryWorker is not null) return;
+        lock (WorkerGate)
+        {
+            if (_queryWorker is not null) return;
+            var worker = new Thread(QueryWorkerLoop)
             {
                 IsBackground = true,
                 Name = "LastRegret.QueryObjectName",
             };
             worker.Start();
-
-            if (!worker.Join(QueryObjectTimeoutMs)) return null;
-            if (status != 0) return null;
-
-            var us = Marshal.PtrToStructure<Win32.UNICODE_STRING>(buffer);
-            if (us.Length <= 0 || us.Buffer == IntPtr.Zero) return null;
-            result = Marshal.PtrToStringUni(us.Buffer, us.Length / 2);
-            return result;
+            _queryWorker = worker;
         }
-        catch (Exception)
+    }
+
+    private static void QueryWorkerLoop()
+    {
+        foreach (var request in QueryQueue.GetConsumingEnumerable())
         {
-            return null;
-        }
-        finally
-        {
-            if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+            // 缓冲区由 worker 自己分配与释放：调用方超时返回后不会再碰它，
+            // 也就不存在"调用方释放、worker 还在写"的竞态。
+            IntPtr buffer = IntPtr.Zero;
+            try
+            {
+                buffer = Marshal.AllocHGlobal(16 * 1024);
+                int status = Win32.NtQueryObject(request.Handle, Win32.ObjectNameInformation, buffer, 16 * 1024, out _);
+                if (status == 0)
+                {
+                    var us = Marshal.PtrToStructure<Win32.UNICODE_STRING>(buffer);
+                    if (us.Length > 0 && us.Buffer != IntPtr.Zero)
+                    {
+                        request.Result = Marshal.PtrToStringUni(us.Buffer, us.Length / 2);
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // 解析失败不影响调用方：它只是拿不到内核级证据
+            }
+            finally
+            {
+                if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+                try { request.Done.Set(); } catch (ObjectDisposedException) { }
+            }
         }
     }
 

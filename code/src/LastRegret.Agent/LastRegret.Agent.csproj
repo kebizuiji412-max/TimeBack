@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    LastRegret.Agent —— timeback-agent 1.0 的最小 CLI + JSON 入口（一次性进程）。
+
+    为什么单独一个宿主（而不是塞进 WPF 的 LastRegret.App）：
+      · GUI 与 CLI 是两种入口，混在一起会让"双击图标启动 GUI"和"被 Agent 调用"互相污染；
+      · 本程序集是纯 Console：编译期就拿不到 WPF，也不可能误加 UI 依赖。
+
+    引用刻意克制：只引用 LastRegret.Runtime（组合根），
+    Engine / Data / Windows / Core 都由 Runtime 自己连 —— Agent 不直接引用它们，
+    更不会碰 SQLite 或受保护目录里的文件。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>LastRegret.Agent</RootNamespace>
+    <AssemblyName>LastRegret.Agent</AssemblyName>
+  </PropertyGroup>
+
+  <!-- Release 不产出 .pdb（与其它项目保持一致：调试符号会泄露源码路径） -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LastRegret.Runtime\LastRegret.Runtime.csproj" />
+  </ItemGroup>
+
+</Project>

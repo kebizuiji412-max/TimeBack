@@ -313,6 +313,26 @@ public sealed class PointRow : ObservableObject
     }
 
     /// <summary>
+    /// 这个时间点凭什么被认出来：优先用户自己留的备注，为空时按"它是怎么来的"回落。
+    ///
+    /// ⚠ 备注**不是**唯一键：选择永远绑定 PointRow 对象本身（SelectedItem），
+    ///   显示文本从不参与反查。这里只解决"人能不能认出它"。
+    /// </summary>
+    public string IdentityLabel => !string.IsNullOrWhiteSpace(Note) ? Note! : UserKindText;
+
+    /// <summary>
+    /// 带身份的时间（时间 · 备注/来源）。下拉、工具栏末端的确认文本、浏览器标题、
+    /// 恢复集合的来源标签都用它 —— 只显示"9月15日 02:27"的话，同一分钟里的
+    /// 两个时间点在界面上完全一样，用户没有依据确认自己选的是哪一个。
+    /// </summary>
+    public string IdentifiedTime => FriendlyTime + " · " + IdentityLabel;
+
+    /// <summary>
+    /// 弱化显示的编号兜底（备注相同或都为空时，靠它区分同一分钟里的多个时间点）。
+    /// </summary>
+    public string IdSuffix => " · #" + Point.SnapshotId.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>
     /// 这个时间点是什么：用户自己留的 / 保护开始时 / 恢复前自动留的。
     /// 不向普通用户暴露"手动恢复点 / 基线 / 安全点"这类内部叫法。
     /// </summary>
@@ -354,8 +374,8 @@ public sealed class PointRow : ObservableObject
     public bool HasEmptyHint => IsEmpty || IsSuspect;
 
     public string? EmptyHint => IsSuspect
-        ? "⚠ " + (SuspectReason ?? "该恢复点内容可能不完整，建议删除。")
-        : (IsEmpty ? "⚠ 这个恢复点没有记录到任何文件，建议删除后重新扫描补齐。" : null);
+        ? "⚠ " + (SuspectReason ?? "这个时间点的内容可能不完整，建议删除。")
+        : (IsEmpty ? "⚠ 这个时间点没有记录到任何文件，建议删除后重新扫描补齐。" : null);
 
     /// <summary>是否允许删除（由引擎判定；这里只用于按钮可用性提示）。</summary>
     public bool CanDelete { get; set; } = true;
@@ -363,8 +383,8 @@ public sealed class PointRow : ObservableObject
     public string? DeleteBlockReason { get; set; }
 
     public string DeleteHint => CanDelete
-        ? "删除这个恢复点（不会改动磁盘文件）"
-        : (DeleteBlockReason ?? "该恢复点受保护，不能删除");
+        ? "删除这个时间点（不会改动磁盘文件）"
+        : (DeleteBlockReason ?? "该时间点受保护，不能删除");
 }
 
 /// <summary>一次恢复操作的展示行（带行内"撤销"动作与撤销可用性说明）。</summary>

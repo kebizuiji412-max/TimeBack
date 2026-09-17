@@ -45,6 +45,17 @@ public sealed class WatchedRootRepository : IWatchedRootRepository
     public long Insert(WatchedRoot root)
     {
         var normalized = PathUtil.NormalizeRoot(root.Path);
+        // ⚠ BB-005：INSERT 与取回自增 Id 必须原子（同一连接上别的线程可能正在插入）。
+        _db.InTransaction(() =>
+        {
+            InsertCore(root, normalized);
+        });
+        root.Path = normalized;
+        return root.Id;
+    }
+
+    private void InsertCore(WatchedRoot root, string normalized)
+    {
         _db.NonQuery(
             "INSERT INTO watched_roots(path, path_key, label, enabled, include_subdirs, created_utc, last_event_utc, baseline_snapshot_id, excludes_json, max_file_size_bytes, scan_state) " +
             "VALUES (?,?,?,?,?,?,?,?,?,?,?);",
@@ -60,8 +71,6 @@ public sealed class WatchedRootRepository : IWatchedRootRepository
             root.MaxFileSizeBytes,
             "idle");
         root.Id = _db.LastInsertRowId();
-        root.Path = normalized;
-        return root.Id;
     }
 
     public void Update(WatchedRoot root)

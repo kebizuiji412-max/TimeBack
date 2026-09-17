@@ -48,6 +48,14 @@ public partial class MainWindow : Window
         _vm.OpenBrowseRowCommand.Execute(row);
     }
 
+    /// <summary>
+    /// 页面级滚轮统一入口（规则见 <see cref="PageScroll"/>）：
+    /// 内层列表还能滚时让内层滚，到边界再交给页面，
+    /// 避免"鼠标停在列表/输入框上，页面就完全滚不动"。
+    /// </summary>
+    private void PageScroll_PreviewMouseWheel(object sender, System.Windows.Input.MouseWheelEventArgs e)
+        => PageScroll.Handle(sender, e);
+
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         // 无论有没有受保护目录，首次打开都落在「首页」：

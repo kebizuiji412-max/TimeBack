@@ -209,19 +209,33 @@ public sealed class ProcessProbe : IProcessProbe
     /// </summary>
     public ProcessAttribution? TryFindHandleOwner(string absolutePath, IReadOnlyList<ProcessAttribution> candidates)
     {
-        var handles = SystemHandleEnumerator.TryCapture(out var entries);
-        if (!handles || entries.Count == 0) return null;
+        // ── 先看本机能力自检的结论（启动时实测并缓存，不额外开销）──
+        // 如果这台机器上**一个**进程都不允许打开句柄，那无论枚举多少次都拿不到内核级证据
+        // —— 直接跳过，不再为每个事件做一次全系统句柄枚举（这不是降低能力，
+        // 而是不做注定失败的工作；只要还有进程可能被打开，就照常尝试）。
+        var capability = GetCapability();
+        if (!capability.HandleEnumerationAvailable || capability.ProcessesOpenable == 0) return null;
 
         var fileTypeIndex = SystemHandleEnumerator.FindFileTypeIndex();
         if (fileTypeIndex < 0) return null;
+        _ = SystemHandleEnumerator.TryCapture(out _);   // 预热缓存（下面按进程号取句柄时直接用）
 
         var normalizedTarget = absolutePath.TrimEnd('\\');
 
+        // 每次调用最多尝试解析几个句柄：解析对象名最坏 1.2 秒，而这里本来就在
+        // "尽力而为"地找内核级证据。不设上限的话，一次批量事件里每个事件都可能赔上好几秒。
+        const int maxNameQueries = 3;
+        var nameQueries = 0;
+
         foreach (var candidate in candidates)
         {
-            foreach (var entry in entries)
+            // 只看**这个候选进程自己**的文件句柄（旧写法是"候选 × 全部系统句柄"的双层循环，
+            // 二十多万条句柄 × 每个事件都要扫一遍，是本次性能事故的主要开销之一）。
+            foreach (var entry in SystemHandleEnumerator.FileHandlesOf(candidate.Pid, (ushort)fileTypeIndex))
             {
                 if (entry.ProcessId != candidate.Pid || entry.ObjectTypeIndex != fileTypeIndex) continue;
+
+                if (nameQueries++ >= maxNameQueries) return null;
 
                 var processHandle = Win32.OpenProcess(Win32.PROCESS_DUP_HANDLE, false, candidate.Pid);
                 if (processHandle == IntPtr.Zero) return null; // 权限不足：立刻放弃，不做无意义重试

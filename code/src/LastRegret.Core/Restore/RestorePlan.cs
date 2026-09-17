@@ -121,14 +121,29 @@ public sealed class RestorePlan
         return string.Join('\\', parts.Take(Math.Min(count, parts.Length)));
     }
 
-    /// <summary>计算（或重算）指纹。指纹对步骤顺序不敏感，只取决于内容集合。</summary>
+    /// <summary>
+    /// 计算（或重算）指纹。指纹对步骤顺序不敏感，只取决于内容集合。
+    ///
+    /// ⚠ 真实缺陷（本轮修复，FINAL-WB-001）：
+    ///   指纹原先只包含
+    ///   <c>Action | RelativePath | SecondaryPath | TargetHash | TargetObjectId | Kind</c>，
+    ///   **不含 <see cref="RestoreStep.ExpectedCurrentHash"/>**（= 预览那一刻磁盘上该路径的内容哈希）。
+    ///   而执行前的"重算指纹再比对"用的是**同一个内存 plan 对象**，于是它永远等于自己 ——
+    ///   这个校验是**自证的**，对"预览之后磁盘又被改过"完全无感：
+    ///   预览 → 改盘 → 用旧指纹执行，仍然通过校验、建 operation、建 pre/post 快照，
+    ///   最后只在逐步冲突检测里被标成 skipped，整体却返回 success。
+    ///   把 <c>ExpectedCurrentHash</c> 纳入指纹后，执行路径用自己的输入**重新生成计划**，
+    ///   新计划的期望哈希来自**此刻**的磁盘状态，与旧指纹必然不同 → 如实拒绝。
+    ///   注意：这**不削弱**任何安全链 —— 逐步冲突检测（只做差异、冲突即跳过）原样保留，
+    ///   这里只是让"预览确认契约"真正生效。
+    /// </summary>
     public string ComputeFingerprint()
     {
         ulong acc = 14695981039346656037UL; // FNV offset
         ulong xor = 0;
         foreach (var s in Steps)
         {
-            var key = $"{s.Action.ToCode()}|{s.RelativePath}|{s.SecondaryPath}|{s.TargetHash}|{s.TargetObjectId}|{s.Kind.ToCode()}";
+            var key = $"{s.Action.ToCode()}|{s.RelativePath}|{s.SecondaryPath}|{s.TargetHash}|{s.TargetObjectId}|{s.Kind.ToCode()}|{s.ExpectedCurrentHash}";
             var h = Fnv1a(key);
             acc = Fnv1a(acc.ToString() + key);
             xor ^= h;

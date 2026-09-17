@@ -55,11 +55,11 @@ public sealed class CompareService
     public IReadOnlyList<SnapshotPoint> ListPoints(long rootId, DateTime? fromUtc = null, DateTime? toUtc = null, int limit = 300)
     {
         var list = new List<SnapshotPoint>();
-        foreach (var s in _snapshotRepo.List(rootId, limit))
+        // ⚠ BB-008：时间范围必须下推到 SQL。
+        // 旧写法是"先取最新 limit 条，再在内存里按 from/to 过滤" ——
+        // 于是查询比"最新 limit 条"更早的时间段时，目标记录根本没进那 limit 条，永远返回空。
+        foreach (var s in _snapshotRepo.List(rootId, limit, fromUtc, toUtc))
         {
-            if (fromUtc is not null && s.TimestampUtc < fromUtc.Value) continue;
-            if (toUtc is not null && s.TimestampUtc > toUtc.Value) continue;
-
             list.Add(new SnapshotPoint
             {
                 SnapshotId = s.Id,
@@ -140,8 +140,23 @@ public sealed class CompareService
         var diff = TreeComparer.Compare(target, current, evidence, maxChanges);
         if (includePaths is not null)
         {
-            var keep = new HashSet<string>(includePaths, LastRegret.Core.Util.PathUtil.Comparer);
-            diff.Changes.RemoveAll(c => !keep.Contains(c.RelativePath));
+            // ⚠ 真实缺陷（本轮修复，F-01 复现矩阵 6/6 命中）：
+            //   这里原先只按**精确路径**过滤（keep.Contains(RelativePath)）。
+            //   而调用方（CLI 的 preview-restore、以及任何没有预先展开目录的入口）
+            //   传进来的是"用户勾选的那个目录"本身 —— 于是该目录下的所有变化
+            //   （包括内部被改过的文件）会被整批剔除，计划变成空的或只剩目录条目。
+            //   用户看到的就是：勾了目录、点了恢复，里面的文件**一点没变**。
+            //   正确语义：勾选一个目录 = 勾选它**以及它下面的整棵子树**；
+            //   勾选一个文件仍然只影响那一个路径（文件不可能有子项，行为不变）。
+            var keep = new List<string>();
+            foreach (var p in includePaths)
+            {
+                var normalized = PathUtil.NormalizeRelative(p);
+                if (normalized.Length > 0) keep.Add(normalized);
+            }
+
+            diff.Changes.RemoveAll(c => !keep.Any(p =>
+                PathUtil.Comparer.Equals(p, c.RelativePath) || PathUtil.IsUnder(p, c.RelativePath)));
         }
         AttachEventTimes(rootId, diff, snapshot.TimestampUtc, _clock.UtcNow);
 

@@ -262,6 +262,15 @@ public sealed class MaintenanceService
                 if (s.Id == latestId) continue;
                 if (s.Kind is SnapshotKind.Manual or SnapshotKind.PreRestore or SnapshotKind.Baseline) continue;
 
+                // ⚠ 真实缺陷（本轮修复，BB-010）：这里必须和 SnapshotService.CanDelete 的
+                //   **硬保护**对齐 —— 尤其是"正被某个恢复操作引用的快照不能删"：
+                //   删掉它，那次恢复就再也撤销不了。清理是自动跑的，不能绕过手动删除的保护规则。
+                if (_restoreRepo.IsSnapshotReferenced(s.Id))
+                {
+                    log?.Invoke($"保留快照 #{s.Id}（{s.TimestampLocal:yyyy-MM-dd HH:mm}）：它正被某个恢复操作引用，删了那次恢复就无法撤销");
+                    continue;
+                }
+
                 _snapshots.Delete(s.Id);
                 log?.Invoke($"已删除快照 #{s.Id}（{s.TimestampLocal:yyyy-MM-dd HH:mm}，{s.Kind.ToChinese()}）");
             }

@@ -1,11 +1,11 @@
-# TimeBack Agent Protocol（协议预留）
+# TimeBack Agent Protocol（协议 1.0 + 最小 CLI 实现）
 
-> **状态：协议预留，尚未实现。**
+> **状态：协议 1.0 不变，已有最小可用的 CLI 实现。**
 >
-> 当前 TimeBack **没有**提供任何 Agent 接口：没有 CLI Agent 命令、没有 MCP Server、
-> 没有 Plugin、没有 Skill、没有网络服务、没有 HTTP / IPC 服务端。
-> 本文件定义的是 **"未来 Agent 应该通过什么能力访问 TimeBack"**，
-> 作为将来真正实现接口时的协议依据。
+> 当前 TimeBack 提供**一个** Agent 入口：独立的 `LastRegret.Agent.exe`（CLI + JSON，见第 13 节）。
+> 除此之外**没有** MCP Server、没有 Plugin、没有 Skill、没有网络服务、没有 HTTP / IPC 服务端，
+> 也没有常驻后台进程；GUI（`LastRegret.exe`）行为与用户视角完全不变。
+> 本文件定义 **"外部 Agent 通过什么能力访问 TimeBack"**，是接口实现的协议依据。
 >
 > 机器可读的能力清单位于项目根目录：`agent-interface.json`。
 
@@ -45,7 +45,7 @@ MCP / 任何第三方 Agent SDK）。协议必须由 TimeBack 自己定义。
 |---|---|
 | 协议名 | `timeback-agent` |
 | 协议版本 | **1.0** |
-| 协议状态 | `reserved`（已预留，未实现） |
+| 协议状态 | `experimental`（协议 1.0 保持不变；已有最小 CLI 实现，见第 13 节） |
 | 产品 | 回溯 / TimeBack |
 | 产品版本 | **0.1.0**（见 `code/Directory.Build.props`） |
 | 平台 | Windows |
@@ -139,25 +139,20 @@ TimeBack Core
 
 ---
 
-## 7. 未来的接口形态（示例，全部未实现）
+## 7. 接口形态：最小 CLI（已实现）
 
 优先考虑**稳定的 CLI + JSON**：进程内一次性调用、stdin/stdout 传 JSON、
 无网络端口、无常驻服务。它最容易审计、最容易限制权限，也最不打扰普通用户。
 
-未来可能存在的形态（**以下命令当前一律不存在，`TimeBack.exe` 目前完全不解析命令行参数**）：
+**最小可用实现已落地**（用法见第 13 节），形态与早期示例略有不同：
 
 ```
-TimeBack.exe agent capabilities
-TimeBack.exe agent protected-folders
-TimeBack.exe agent timeline
-TimeBack.exe agent changes
-TimeBack.exe agent preview-restore
-TimeBack.exe agent restore
-TimeBack.exe agent undo
+LastRegret.Agent.exe <command>        # 独立可执行文件，一次进程一次调用
 ```
 
-这些只是协议文档里的示例，用来固定"未来该往哪个方向长"。
-写出它们**不代表现在要改命令行参数** —— 现在没有任何命令行参数需要兼容。
+早期文档里写过的 `TimeBack.exe agent capabilities` 只是"往哪个方向长"的示例；
+真正落地时选了**独立可执行文件**，因为它让 GUI 与 CLI 的边界在进程层面就分开：
+`LastRegret.exe` 至今**完全不解析命令行参数**，两条入口互不污染。
 
 不论最终采用哪种形态，以下输出约定应当保持：
 
@@ -236,27 +231,121 @@ TimeBack 现有的安全机制是**现成的**，Agent 接口必须复用、不�
 
 ---
 
-## 11. 现状记录（本轮只记录，未修改任何代码）
+## 11. 落地记录（现状观察 + 已兑现部分）
 
-以下是与"未来 Agent 接口"相关的现状观察。按任务要求，**只记录，不顺手修改**：
+以下是与"未来 Agent 接口"相关的现状观察，最初**只记录、不顺手修改**。
+最小 CLI（第 13 节）落地后，逐条复核如下（未改动的仍如实标注）：
 
-1. **入口没有历史包袱。** `LastRegret.exe` 目前**完全不解析命令行参数**
-   （`App.xaml.cs` 中没有读取 `e.Args`）。将来加 `agent` 子命令是全新入口，
-   不存在"改动现有参数"的风险。
-2. **引擎可直接复用，不需要重写。** `AppRuntime.Create()` / `Dispose()` 都是 public，
-   且 `LastRegret.Runtime` 工程以 `net8.0` 为目标 —— 编译期就保证它不认识 WPF。
-   未来的 CLI / JSON 适配层可以直接复用同一套引擎。
+1. **入口没有历史包袱。** `LastRegret.exe` 至今**完全不解析命令行参数**
+   （`App.xaml.cs` 中没有读取 `e.Args`）。CLI 因此走了独立可执行文件，
+   不存在"改动现有参数"的风险。（仍然成立）
+2. **引擎可直接复用，不需要重写。** ——**已兑现**：CLI 宿主直接调用
+   `AppRuntime.Create()` / `Dispose()`，自身只做参数解析与 JSON 编解码，
+   `LastRegret.Agent` 工程以 `net8.0` 为目标、只引用 `LastRegret.Runtime`，
+   编译期就保证它不认识 WPF。
    （`App.DisposeRuntime` 那个幂等包装只是 WPF 壳自用的，CLI 宿主用不到。）
-3. **安全机制现成。** `Execute` 与 `ExecuteUndo` 都已经要求传入预览指纹，
-   并且执行前必然建立安全点。也就是说未来做 Agent 接口时**不需要新造安全机制**，
-   只需要"不绕过"。
-4. **一处与本协议无关的既有不一致（仅记录）：** `code/Directory.Build.props` 里的
+3. **安全机制现成。** ——**已兑现**：`restore` 要求传入预览指纹、执行前必然建立安全点，
+   CLI **没有新造任何安全机制**，只是"不绕过"。
+4. **一处与本协议无关的既有不一致（仍仅记录）：** `code/Directory.Build.props` 里的
    `Product` 仍是旧品牌「最后悔的 Ctrl+Z」，被 `LastRegret.App.csproj` 的
-   `回溯 (TimeBack)` 覆盖。不影响构建产物，也不属于本协议范围，本轮未改动。
+   `回溯 (TimeBack)` 覆盖。不影响构建产物，也不属于本协议范围，**未改动**。
 
 ---
 
 ## 12. 一句话总结
 
-**未来 Agent 有一份明确的协议入口：能力清单 + 能力语义 + 安全边界；**
-**而现在的 TimeBack 没有新增任何 Agent 功能，用户视角完全无感知，1.0 行为保持不变。**
+**Agent 侧现在有一个最小可用的 CLI 入口：一次调用、JSON 进、JSON 出，且完全复用现有的恢复安全机制；**
+**GUI 用户视角依然无感知，协议版本仍是 1.0，能力集合没有增加。**
+
+---
+
+## 13. 最小 CLI 用法（已实现）
+
+**定位：最小可用，不是完整 Adapter。** 可以简陋，但不可以危险 ——
+不监听端口、不做常驻服务、不新增能力、不提供绕过预览或忽略指纹的任何开关。
+
+### 13.1 调用形态
+
+```
+LastRegret.Agent.exe <command> [<request.json>]
+```
+
+- `<command>`：能力 id（`protected-folders` / `timeline` / `changes` / `preview-restore` /
+  `restore` / `undo`）或 `capabilities` / `help`（`help` 返回用法说明）。
+  **命令只认 argv**，stdin 只承载参数（stdin 里出现的 `capability` 字段不会被使用）。
+- 请求体**只从 stdin 读**（一个 JSON 对象）：`echo '{...}' | LastRegret.Agent.exe timeline`。
+  管道里没有内容时按"空请求"处理。全部字段可选（`rootId` / `atUtc` / `limit` / `fingerprint` /
+  `allowNewRemovals` / `operationId` 等），缺什么由对应命令自行校验；
+  无参数的命令（如 `capabilities`）可以完全不给 stdin。
+- 进程内一次性调用：**一次调用只处理一个请求**，处理完即退出。
+
+### 13.2 输出约定
+
+- **stdout 恰好是一个 JSON 对象**，没有日志、没有前后缀，可被任何 JSON 解析器直接解析。
+- 诊断信息一律走 **stderr**（例如 JSON 语法错误的细节），stdout 保持干净。
+- 退出码：`0` 成功或无变化，`1` 参数/命令/JSON 不合法，`2` 被安全规则拒绝，`3` 执行失败。
+- `error` 与 `warnings` **在空的时候不出现**（不是 `null`，也不是 `[]`）。
+
+成功（真实输出，已省略部分字段）：
+
+```json
+{ "protocol": "timeback-agent", "version": "1.0", "capability": "restore.preview",
+  "ok": true, "status": "success",
+  "data": { "fingerprint": "3DC82391F3216E38B7A493DB6364D839", "hasEffect": true,
+            "stepCount": 1, "toRestore": 1, "toRemove": 0, "affected": 1, "warnings": [] } }
+```
+
+被拒绝（退出码 2，**不会伪装成成功**）：
+
+```json
+{ "protocol": "timeback-agent", "version": "1.0", "capability": "restore.execute",
+  "ok": false, "status": "rejected",
+  "error": { "code": "fingerprint_mismatch",
+             "message": "恢复计划已经变化，请重新预览后再执行。" } }
+```
+
+`status` 有四种：`success` / `no_change` / `rejected` / `failed` ——
+`ok` 与 `status` 必须一致（拒绝与失败绝不可能是 `ok: true`），
+`error.code` 是可分辨的机器可读代码（`unknown_command` / `invalid_request` /
+`missing_parameter` / `root_not_found` / `fingerprint_required` / `fingerprint_mismatch` /
+`undo_unavailable` / `internal_error` 等）。
+
+### 13.3 示例
+
+探查能力清单（不需要初始化引擎，无副作用）：
+
+```
+LastRegret.Agent.exe capabilities
+```
+
+只读预览（不改动任何文件，可反复调用）：
+
+```
+echo {"rootId":1,"atUtc":"2026-09-14T02:12:10.0466796Z"} | LastRegret.Agent.exe preview-restore
+```
+
+确认执行（**必须带上预览返回的 `fingerprint`**）：
+
+```
+echo {"rootId":1,"atUtc":"...","fingerprint":"3DC8...D839","allowNewRemovals":false} | LastRegret.Agent.exe restore
+```
+
+撤销：不带 `fingerprint` 时等同于"预览能否撤销"（返回指纹），带上时才真正执行：
+
+```
+echo {"rootId":1,"operationId":1} | LastRegret.Agent.exe undo
+```
+
+### 13.4 边界（重要）
+
+- **`restore` 不接受完整恢复计划。** 恢复计划是引擎内部结构，不上线到接口上；
+  CLI 只接收"根目录 + 时间点"，**自己重新推导一次计划，仅用于比对调用方给的指纹**。
+  指纹不一致会在**任何写入之前**以 `fingerprint_mismatch` 拒绝 ——
+  即"确认的必须是同一份预览"这条规则在 CLI 上同样成立。
+- **`undo` 不新增能力。** 它复用 `restore.undo`：无指纹=预览，有指纹=执行。
+- **`includePaths` 里的目录路径表示"它以及它下面的整棵子树"。**
+  勾选一个文件夹就是要恢复文件夹里的内容，而不是只恢复文件夹这个条目本身；
+  勾选一个文件仍然只影响那一个路径。
+- **没有 `force` / `skip-preview` 之类的开关**，也不打算加。
+- **`capabilities` 的清单与 `agent-interface.json` 保持一致**（由测试强制校验），
+  协议版本与能力集合在本轮**均未变更**。

@@ -119,15 +119,28 @@
             </StackPanel>
         </Border>
 
-        <!-- ══════════════ 错误横幅 ══════════════ -->
-        <Border Grid.Row="1" Background="{StaticResource DangerDim}" BorderBrush="{StaticResource Danger}" BorderThickness="0,0,0,1"
-                Padding="8,4" Visibility="{Binding HasErrorBanner, Converter={StaticResource BoolVis}}">
-            <DockPanel LastChildFill="False">
-                <Button DockPanel.Dock="Right" Content="忽略" Style="{StaticResource ToolButton}" Margin="6,0,0,0"
-                        Command="{Binding DismissErrorCommand}" />
-                <TextBlock Text="{Binding LastErrorBanner}" TextWrapping="Wrap" FontSize="11.5" VerticalAlignment="Center" />
-            </DockPanel>
-        </Border>
+        <!-- ══════════════ 顶部提示：错误 + 一般提示 ══════════════ -->
+        <!--
+            为什么必须有下面那条"一般提示"横幅（本轮修复）：
+              MainViewModel 里有十余处把说明写进 InfoBanner（标记删除的结果、恢复集合为空的原因、
+              "所选内容已经是目标状态，无需恢复"等等），但这个属性**从来没有被绑定到任何控件**，
+              于是这些提示全部被静默吞掉 —— 用户点了按钮却"什么都没发生"。
+              这里把它接到同一条横幅区域，不改动任何页面结构。
+        -->
+        <StackPanel Grid.Row="1">
+            <Border Background="{StaticResource DangerDim}" BorderBrush="{StaticResource Danger}" BorderThickness="0,0,0,1"
+                    Padding="8,4" Visibility="{Binding HasErrorBanner, Converter={StaticResource BoolVis}}">
+                <DockPanel LastChildFill="False">
+                    <Button DockPanel.Dock="Right" Content="忽略" Style="{StaticResource ToolButton}" Margin="6,0,0,0"
+                            Command="{Binding DismissErrorCommand}" />
+                    <TextBlock Text="{Binding LastErrorBanner}" TextWrapping="Wrap" FontSize="11.5" VerticalAlignment="Center" />
+                </DockPanel>
+            </Border>
+            <Border Background="{StaticResource BgWindow}" BorderBrush="{StaticResource Border}" BorderThickness="0,0,0,1"
+                    Padding="8,4" Visibility="{Binding HasInfoBanner, Converter={StaticResource BoolVis}}">
+                <TextBlock Text="{Binding InfoBanner}" TextWrapping="Wrap" FontSize="11.5" VerticalAlignment="Center" />
+            </Border>
+        </StackPanel>
 
         <!-- ══════════════ 内容 ══════════════ -->
         <Grid Grid.Row="2">
@@ -357,11 +370,15 @@
                         <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
                             <TextBlock Text="{Binding TargetArrowLabel}" Style="{StaticResource Caption}" VerticalAlignment="Center"
                                        Margin="0,0,3,0" />
-                            <ComboBox Width="130" Style="{StaticResource ToolCombo}" ItemsSource="{Binding TargetPointChoices}"
+                            <ComboBox Width="210" Style="{StaticResource ToolCombo}" ItemsSource="{Binding TargetPointChoices}"
                                       SelectedItem="{Binding SelectedTargetPoint, Mode=TwoWay}"
                                       ToolTip="恢复到另一个时间点；点右边「当前状态」回到现在">
                                 <ComboBox.ItemTemplate>
-                                    <DataTemplate><TextBlock Text="{Binding FriendlyTime}" FontSize="11.5" /></DataTemplate>
+                                    <!-- 时间 + 身份（备注或来源），末尾弱化编号兜底：
+                                         只显示"9月15日 02:27"的话，同一分钟里的两个时间点没法分辨 -->
+                                    <DataTemplate>
+                                        <TextBlock FontSize="11.5" ToolTip="{Binding IdentifiedTime}"><Run Text="{Binding IdentifiedTime}" /><Run Text="{Binding IdSuffix}" Foreground="{StaticResource FgDisable}" /></TextBlock>
+                                    </DataTemplate>
                                 </ComboBox.ItemTemplate>
                             </ComboBox>
                             <TextBlock Text="{Binding TargetEndText}" FontSize="11.5" VerticalAlignment="Center"
@@ -372,11 +389,14 @@
 
                         <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
                             <TextBlock Text="时间点" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,3,0" />
-                            <ComboBox Width="130" Style="{StaticResource ToolCombo}" ItemsSource="{Binding TimePointChoices}"
+                            <ComboBox Width="210" Style="{StaticResource ToolCombo}" ItemsSource="{Binding TimePointChoices}"
                                       SelectedItem="{Binding SelectedTimePointChoice, Mode=TwoWay}"
                                       ToolTip="选一个要回到的时间点">
                                 <ComboBox.ItemTemplate>
-                                    <DataTemplate><TextBlock Text="{Binding FriendlyTime}" FontSize="11.5" /></DataTemplate>
+                                    <!-- 同上：时间 + 身份，编号弱化显示 -->
+                                    <DataTemplate>
+                                        <TextBlock FontSize="11.5" ToolTip="{Binding IdentifiedTime}"><Run Text="{Binding IdentifiedTime}" /><Run Text="{Binding IdSuffix}" Foreground="{StaticResource FgDisable}" /></TextBlock>
+                                    </DataTemplate>
                                 </ComboBox.ItemTemplate>
                             </ComboBox>
                             <TextBlock Text="{Binding FromEndText}" FontSize="11.5" FontWeight="SemiBold" VerticalAlignment="Center"
@@ -638,28 +658,19 @@
 
             <!-- ────────── 设置：普通设置 + 折叠的高级设置 ────────── -->
             <!-- 设置页：整页设置比窗口高，**必须**有一个可靠的滚动方式。
-                 实测：这台机器上 ScrollViewer/ListBox 配 Hidden 垂直条时收不到滚轮事件，
-                 所以这里保留一条细滚动条 —— 内容多的时候用户至少能滚。
-                 （列表类页面用 Hidden + 滚轮是正常的，见 ToolList。） -->
-            <ListBox Visibility="{Binding IsSettingsPage, Converter={StaticResource BoolVis}}"
-                     Background="Transparent" BorderThickness="0" Focusable="False"
-                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
-                     ScrollViewer.VerticalScrollBarVisibility="Auto"
-                     ScrollViewer.CanContentScroll="True">
-                <ListBox.ItemContainerStyle>
-                    <Style TargetType="ListBoxItem">
-                        <Setter Property="Padding" Value="0" />
-                        <Setter Property="Margin" Value="0" />
-                        <Setter Property="Focusable" Value="False" />
-                        <Setter Property="Template">
-                            <Setter.Value>
-                                <ControlTemplate TargetType="ListBoxItem">
-                                    <ContentPresenter />
-                                </ControlTemplate>
-                            </Setter.Value>
-                        </Setter>
-                    </Style>
-                </ListBox.ItemContainerStyle>
+                 按本项目约定：不显示滚动条，一律用鼠标滚轮上下滚（Hidden 只是不画长条，
+                 滚轮能力照旧保留）。
+                 之前用的是"只有一个条目的 ListBox + CanContentScroll=True"：那是按条目
+                 滚动，一个超高条目等于没有可滚区间 —— 滚轮完全不动、下面的设置够不到
+                 （实测根因；与滚动条显示与否无关，早先"Hidden 收不到滚轮"的结论是错的）。
+                 滚轮统一交给 PageScroll_PreviewMouseWheel 裁决：内层控件还能滚时让内层滚，
+                 到边界再交给页面，避免"鼠标停在列表/输入框上页面就滚不动"。 -->
+            <ScrollViewer Visibility="{Binding IsSettingsPage, Converter={StaticResource BoolVis}}"
+                          VerticalScrollBarVisibility="Hidden"
+                          HorizontalScrollBarVisibility="Disabled"
+                          CanContentScroll="False"
+                          Focusable="False"
+                          PreviewMouseWheel="PageScroll_PreviewMouseWheel">
                 <StackPanel Margin="8,6,8,8">
 
                     <!-- 保护文件夹 -->
@@ -777,14 +788,14 @@
                     <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
                         <StackPanel>
                             <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap" LineHeight="16"
-                                       Text="删除「谁在什么时候改了什么」这些记录。磁盘上的文件不会被改动，已存在的恢复点仍然可以恢复。删除后无法撤销。" />
+                                       Text="删除「谁在什么时候改了什么」这些记录。磁盘上的文件不会被改动，已经保存的时间点仍然可以恢复。删除后无法撤销。" />
                             <Button Content="清空当前范围的变化记录" Style="{StaticResource ToolDangerButton}"
                                     HorizontalAlignment="Left" Margin="0,6,0,0"
                                     Command="{Binding ClearAllEventsCommand}"
                                     AutomationProperties.Name="清空变化记录" />
                             <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap" LineHeight="16" Margin="0,6,0,0"
-                                       Text="如果要真正把占用的磁盘空间还回去（内容库通常是大头），用下面这个：连同恢复点与内容库一起清空。" />
-                            <Button Content="清空全部历史数据（含恢复点与内容库）" Style="{StaticResource ToolDangerButton}"
+                                       Text="如果要真正把占用的磁盘空间还回去（保存的历史文件内容通常是大头），用下面这个：连同时间点与历史内容一起清空。" />
+                            <Button Content="清空全部历史数据（含时间点与历史内容）" Style="{StaticResource ToolDangerButton}"
                                     HorizontalAlignment="Left" Margin="0,6,0,0"
                                     Command="{Binding PurgeAllHistoryCommand}"
                                     AutomationProperties.Name="清空全部历史数据" />
@@ -795,7 +806,7 @@
                     <Border Background="{StaticResource BgPanel}" BorderBrush="{StaticResource Border}" BorderThickness="1" Padding="6,4">
                         <StackPanel>
                             <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap" LineHeight="16"
-                                       Text="把保护范围登记、变化记录、恢复点、内容库全部删除，回到「从没用过」的状态。磁盘上的原始文件不会被删除或修改。" />
+                                       Text="把保护范围、变化记录、可以回到的时间点、保存的历史内容全部删除，回到「从没用过」的状态。磁盘上的原始文件不会被删除或修改。" />
                             <Button Content="清空全部数据并移除保护范围" Style="{StaticResource ToolDangerButton}"
                                     HorizontalAlignment="Left" Margin="0,6,0,0"
                                     Command="{Binding ClearAllDataCommand}"
@@ -885,7 +896,7 @@
                                                  Text="{Binding SettingMaxFileSizeMb, UpdateSourceTrigger=LostFocus}" />
                                     </StackPanel>
                                     <StackPanel>
-                                        <TextBlock Text="自动恢复点 (分钟,0=关)" Style="{StaticResource Caption}" />
+                                        <TextBlock Text="自动保存时间点 (分钟,0=关)" Style="{StaticResource Caption}" />
                                         <TextBox Width="80" Style="{StaticResource ToolBox}"
                                                  Text="{Binding SettingAutoSnapshotMinutes, UpdateSourceTrigger=LostFocus}" />
                                     </StackPanel>
@@ -917,11 +928,11 @@
                                 </WrapPanel>
                                 <TextBlock Text="排除的文件名（每行一个）" Style="{StaticResource Caption}" Margin="0,4,0,2" />
                                 <TextBox Height="52" Style="{StaticResource ToolBox}" AcceptsReturn="True"
-                                         VerticalScrollBarVisibility="Auto" FontFamily="{StaticResource MonoFont}"
+                                         VerticalScrollBarVisibility="Hidden" FontFamily="{StaticResource MonoFont}"
                                          Text="{Binding ExcludePatternsText, UpdateSourceTrigger=LostFocus}" />
                                 <TextBlock Text="排除的文件夹名（每行一个）" Style="{StaticResource Caption}" Margin="0,4,0,2" />
                                 <TextBox Height="52" Style="{StaticResource ToolBox}" AcceptsReturn="True"
-                                         VerticalScrollBarVisibility="Auto" FontFamily="{StaticResource MonoFont}"
+                                         VerticalScrollBarVisibility="Hidden" FontFamily="{StaticResource MonoFont}"
                                          Text="{Binding ExcludeDirectoriesText, UpdateSourceTrigger=LostFocus}" />
                                 <WrapPanel Margin="0,6,0,0">
                                     <CheckBox Content="记录是哪个程序改的" IsChecked="{Binding SettingAttribution}" FontSize="11.5" Margin="0,0,12,0" />
@@ -949,7 +960,7 @@
                         </Border>
                     </StackPanel>
                 </StackPanel>
-            </ListBox>
+            </ScrollViewer>
 
             <!-- ────────── 运行日志（从设置进入） ────────── -->
             <Grid Visibility="{Binding IsLogPage, Converter={StaticResource BoolVis}}" Margin="8,6,8,6">

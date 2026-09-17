@@ -13,6 +13,15 @@ public sealed class RestoreRepository : IRestoreRepository
 
     public long Insert(RestoreOperation op)
     {
+        // ⚠ BB-005：INSERT 与取回自增 Id 必须原子 —— 恢复执行期间监听线程仍在写事件行，
+        // 两步之间被插进来一行的话，这里会把**事件行的 Id** 当成恢复操作 Id 用，
+        // 后续的"撤销这次恢复"就会指向错误的对象。
+        _db.InTransaction(() => InsertCore(op));
+        return op.Id;
+    }
+
+    private void InsertCore(RestoreOperation op)
+    {
         _db.NonQuery(
             """
             INSERT INTO restore_operations(root_id, target_ts_utc, target_ts_local, target_snapshot_id, pre_snapshot_id,
@@ -37,7 +46,6 @@ public sealed class RestoreRepository : IRestoreRepository
             op.UndoneByOperationId,
             op.UndoesOperationId);
         op.Id = _db.LastInsertRowId();
-        return op.Id;
     }
 
     public void Update(RestoreOperation op)

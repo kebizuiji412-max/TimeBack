@@ -92,7 +92,26 @@ public sealed class WatchService : IDisposable
     private readonly IClock _clock;
 
     private readonly object _gate = new();
-    private readonly Dictionary<long, DirectoryWatcher> _watchers = new();
+
+    /// <summary>
+    /// **事件处理的串行闸门**（与 <see cref="_gate"/> 分工不同，刻意分开）。
+    ///
+    /// 线程模型（本轮定死）：
+    ///   · watcher 线程：只把通知塞进 <see cref="_inbox"/>（由 _gate 保护，动作极短）；
+    ///   · 处理链路："取收件箱 → 交给合并器 → 落库 → 更新索引"，
+    ///     入口有两个 —— **调度线程的 Tick** 和 **任意调用线程的 FlushPending**
+    ///     （界面、恢复前后、创建快照前、测试都会调）。
+    /// 两者原本都在 _gate 之外，于是 EventMerger 的 _pending/_recent/_ready
+    /// 以及索引更新会被并发改写（普通 Dictionary，并发写会直接抛异常或丢事实）。
+    ///
+    /// 为什么单独一把锁、而不是塞进 _gate：
+    ///   · 处理链路可能耗时（落库、写清单），塞进 _gate 会把 watcher 的入队一起堵住，
+    ///     造成"为了线程安全制造更大的锁竞争"；
+    ///   · 这里只串行"处理链路"本身，锁的持有范围与原设计里单线程执行时的范围一致。
+    /// </summary>
+    private readonly object _processGate = new();
+
+    private readonly WatcherRegistry _registry = new();
     private readonly Queue<(long RootId, RawFsNotification Notification)> _inbox = new();
     private readonly List<(long RootId, string Reason)> _pendingRescans = new();
     private readonly Dictionary<long, RootRuntimeState> _states = new();
@@ -106,6 +125,9 @@ public sealed class WatchService : IDisposable
     private Timer? _timer;
     private volatile bool _disposed;
     private DateTime _lastAutoSnapshotCheck = DateTime.MinValue;
+
+    /// <summary>事件流水线：内容保存 → 事件构建 → 归属 → 落库 → 索引 → 版本。</summary>
+    private readonly WatchEventPipeline _pipeline;
 
     public WatchService(
         LastRegretDatabase db,
@@ -140,8 +162,40 @@ public sealed class WatchService : IDisposable
         _merger = BuildMerger();
         Statistics = new WatchStatistics();
 
+        // 事件流水线：把"合并后的事件"变成落库的事实。它不持有运行状态，
+        // 需要运行状态时通过下面两个委托取（状态所有权仍在本类，见提示词 §二十五）。
+        _pipeline = new WatchEventPipeline(
+            _roots,
+            _index,
+            _events,
+            _versions,
+            ContentWriter,
+            _processProbe,
+            _clock,
+            () => _settings,
+            rootId => _states.TryGetValue(rootId, out var s) ? s : null,
+            OnEventPersisted,
+            () => _merger.PendingCount,
+            Statistics,
+            () => TimelineChanged?.Invoke());
+
         // 快照建立前先把待确认事件落库，保证"状态"与"事件"对齐
         _snapshots.FlushPendingEvents = FlushPending;
+    }
+
+    /// <summary>
+    /// 流水线报告"某个根落库了事件"：调度侧的记账（自动快照依据）。
+    /// 与拆分前逐字一致：每个事件各记一次 last = 该事件时间、计数 +1。
+    /// </summary>
+    private void OnEventPersisted(long rootId, DateTime atUtc)
+    {
+        // 这两个字典也会被界面线程读（GetStates / PendingSnapshotEvents），
+        // 所以读写都用 _gate 保护 —— 只包住两次字典操作，锁范围极小。
+        lock (_gate)
+        {
+            _dirtySince[rootId] = atUtc;
+            _eventsSinceSnapshot[rootId] = _eventsSinceSnapshot.TryGetValue(rootId, out var n) ? n + 1 : 1;
+        }
     }
 
     public ContentWriter ContentWriter { get; }
@@ -168,9 +222,16 @@ public sealed class WatchService : IDisposable
 
     public void ReloadSettings()
     {
-        _settings = _settingsRepo.Load();
-        _matchers.Clear();
-        _merger = BuildMerger();
+        // 换合并器实例前必须先把它里面待确认的事件落库，否则那批事实会随着
+        // 旧实例一起被丢掉（设置一变就静默少记几条变化）。
+        // 与处理链路共用同一把闸门，避免"正在处理时被换掉"。
+        lock (_processGate)
+        {
+            FlushMerger(force: true);
+            _settings = _settingsRepo.Load();
+            _matchers.Clear();
+            _merger = BuildMerger();
+        }
     }
 
     /// <summary>启动后台调度。已经启动则无副作用。</summary>
@@ -180,7 +241,14 @@ public sealed class WatchService : IDisposable
         {
             if (_disposed) throw new ObjectDisposedException(nameof(WatchService));
             if (_timer is not null) return;
-            _timer = new Timer(_ => SafeTick(), null, TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(250));
+            // ⚠ 调度周期必须**小于**合并器的"稳定判据"（AppSettings.SettleDelayMs = 200ms），
+            //   否则一个 200ms 的稳定间隔根本来不及被观测到：pending 条目会一路吸收，
+            //   直到 MaxConfirmDelayMs（8 秒）才被迫收束 ——
+            //   最终表现为"每 8 秒才留下一条历史"（真实缺陷 FINAL-WB-003：
+            //   100 轮、每轮间隔 200ms、共 300 次写入，最后只剩 12 条历史）。
+            //   250ms → 100ms 之后，稳定间隔能被可靠地看到，且空闲 tick 几乎不耗资源
+            //   （没有事件可处理时只做几次空判断）。
+            _timer = new Timer(_ => SafeTick(), null, TimeSpan.FromMilliseconds(80), TimeSpan.FromMilliseconds(100));
         }
         Log("info", "后台监听已启动");
     }
@@ -194,8 +262,13 @@ public sealed class WatchService : IDisposable
             _timer = null;
         }
 
-        FlushMerger(force: true);
-        DrainInbox();
+        // ⚠ 真实缺陷（本轮修复，BB-006）：这里原本先 FlushMerger 再 `DrainInbox();`
+        //   并把返回值丢掉 —— 收件箱里最后一批通知被取出后**没有任何人处理**，
+        //   退出时静默丢失（"最后几毫秒的改动不见了"）。
+        //   FlushPending 里同样的错误早年修过（见那里的 PIT 记录），Stop 这条路径漏了。
+        //   现在的做法是直接复用 FlushPending（同一把处理闸门 + 同一套顺序）：
+        //   先把取出的通知真正交给下一步，再强制把合并器里待确认的一切落库。
+        FlushPending();
         Log("info", "后台监听已停止（已落库待确认事件）");
     }
 
@@ -214,26 +287,18 @@ public sealed class WatchService : IDisposable
             return;
         }
 
-        DirectoryWatcher? watcher = null;
+        DirectoryWatcher? watcher;
         lock (_gate)
         {
-            if (_watchers.TryGetValue(rootId, out watcher) && watcher.IsRunning)
+            if (_registry.IsRunning(rootId))
             {
                 State(root).Watching = true;
                 return;
             }
 
-            // 回调必须认得出"是我这个监听器在报错"：暂停→恢复会先后存在两个监听器实例，
-            // 被停掉的那个如果迟到报错，绝不能把新监听器的状态改掉（见 OnWatchError）。
-            DirectoryWatcher? self = null;
-            self = new DirectoryWatcher(
-                rootId,
-                root.Path,
-                root.IncludeSubdirectories,
-                batch => OnBatch(batch),
-                error => OnWatchError(self!, error));
-            watcher = self;
-            _watchers[rootId] = self;
+            // 创建与登记（含"回调必须认得出是哪个实例"的一致性保护）交给 WatcherRegistry。
+            // 锁仍由本类持有：统一状态机 + 一把锁的模型不变（见该组件头部说明）。
+            watcher = _registry.CreateAndRegister(rootId, root, OnBatch, OnWatchError);
         }
 
         bool ok = watcher.Start();
@@ -260,13 +325,9 @@ public sealed class WatchService : IDisposable
 
     public void StopWatching(long rootId)
     {
-        DirectoryWatcher? watcher = null;
-        lock (_gate)
-        {
-            if (_watchers.Remove(rootId, out watcher)) { /* 取出后关闭 */ }
-        }
-        watcher?.Stop(TimeSpan.FromSeconds(3));
-        watcher?.Dispose();
+        DirectoryWatcher? watcher;
+        lock (_gate) watcher = _registry.TakeOut(rootId);
+        WatcherRegistry.Shutdown(watcher);
 
         var root = _roots.Get(rootId);
         if (root is not null && _states.TryGetValue(rootId, out var state)) state.Watching = false;
@@ -279,7 +340,7 @@ public sealed class WatchService : IDisposable
     {
         lock (_gate)
         {
-            if (_watchers.TryGetValue(rootId, out var watcher)) watcher.Pause();
+            _registry.Pause(rootId);
         }
         if (_states.TryGetValue(rootId, out var state)) state.Paused = true;
     }
@@ -289,7 +350,7 @@ public sealed class WatchService : IDisposable
     {
         lock (_gate)
         {
-            if (_watchers.TryGetValue(rootId, out var watcher)) watcher.Resume();
+            _registry.Resume(rootId);
         }
         if (_states.TryGetValue(rootId, out var state)) state.Paused = false;
         if (rescan) RequestRescan(rootId, "恢复记录后重新对齐");
@@ -334,10 +395,15 @@ public sealed class WatchService : IDisposable
     /// </summary>
     public void FlushPending()
     {
-        var notifications = DrainInbox();
-        ProcessNotifications(notifications);
-        FlushMerger(force: true);
-        SyncMergerStatistics();
+        // 与调度线程的 Tick 共用同一把闸门：两者原本都能在 _gate 之外并发跑完
+        // "取收件箱 → 合并 → 落库 → 更新索引"，会并发改写合并器内部集合。
+        lock (_processGate)
+        {
+            var notifications = DrainInbox();
+            ProcessNotifications(notifications);
+            FlushMerger(force: true);
+            SyncMergerStatistics();
+        }
     }
 
     /// <summary>把一批通知交给合并器并落库（按根分组，保证根路径可解析）。</summary>
@@ -355,7 +421,7 @@ public sealed class WatchService : IDisposable
             var batch = group.Select(g => g.Notification).ToList();
             try
             {
-                PersistCoalesced(_merger.Ingest(rootPaths, batch));
+                _pipeline.Persist(_merger.Ingest(rootPaths, batch));
             }
             catch (Exception ex)
             {
@@ -403,8 +469,7 @@ public sealed class WatchService : IDisposable
         bool stillCurrent;
         lock (_gate)
         {
-            stillCurrent = _watchers.TryGetValue(error.RootId, out var current)
-                           && ReferenceEquals(current, source);
+            stillCurrent = _registry.IsCurrent(source, error.RootId);
         }
 
         if (!stillCurrent) return;
@@ -453,18 +518,25 @@ public sealed class WatchService : IDisposable
 
         ProcessPendingRescans();
 
-        var notifications = DrainInbox();
-        if (notifications.Count > 0) ProcessNotifications(notifications);
+        // ── 处理链路：与 FlushPending（任意调用线程）串行 ──
+        // 只把这一段放进闸门：重新对齐（上面）与自动快照（下面）都可能耗时，
+        // 把它们也圈进来会让界面的"立刻落库"长时间阻塞。自动快照内部会自己
+        // 走 FlushPending（快照前必须落库），因此不会与这里并发写同一批数据。
+        lock (_processGate)
+        {
+            var notifications = DrainInbox();
+            if (notifications.Count > 0) ProcessNotifications(notifications);
 
-        // 推进合并窗口（延迟确认）
-        var settled = _merger.Advance(now);
-        PersistCoalesced(settled);
+            // 推进合并窗口（延迟确认）
+            var settled = _merger.Advance(now);
+            _pipeline.Persist(settled);
 
-        SyncMergerStatistics();
+            SyncMergerStatistics();
 
-        Statistics.PendingInMerger = _merger.PendingCount;
-        Statistics.ActiveWatchers = _watchers.Values.Count(w => w.IsRunning);
-        Statistics.OverflowCount = Math.Max(Statistics.OverflowCount, _watchers.Values.Sum(w => w.OverflowCount));
+            Statistics.PendingInMerger = _merger.PendingCount;
+            Statistics.ActiveWatchers = _registry.All.Count(w => w.IsRunning);
+            Statistics.OverflowCount = Math.Max(Statistics.OverflowCount, _registry.All.Sum(w => w.OverflowCount));
+        }
 
         MaybeAutoSnapshot(now);
         MaybeSaveProcessSnapshot(now);
@@ -508,7 +580,7 @@ public sealed class WatchService : IDisposable
                 // 重新对齐之后必须刷新快照，否则"时间线"与"快照链"会错位
                 _snapshots.Create(rootId, SnapshotKind.Resync,
                     $"重新对齐后建立的状态点（{reason}）");
-                _eventsSinceSnapshot[rootId] = 0;
+                ResetEventCount(rootId);
                 state.NeedsRescan = false;
                 TimelineChanged?.Invoke();
             }
@@ -541,7 +613,7 @@ public sealed class WatchService : IDisposable
         try
         {
             var produced = force ? _merger.Flush(_clock.UtcNow) : _merger.Advance(_clock.UtcNow);
-            PersistCoalesced(produced);
+            _pipeline.Persist(produced);
         }
         catch (Exception ex)
         {
@@ -549,295 +621,8 @@ public sealed class WatchService : IDisposable
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // 事件落库 + 索引维护
-    // ─────────────────────────────────────────────────────────────────────
-
-    private void PersistCoalesced(IReadOnlyList<CoalescedEvent> produced)
-    {
-        if (produced.Count == 0) return;
-
-        var rootCache = new Dictionary<long, WatchedRoot?>();
-        var events = new List<FileEvent>(produced.Count);
-        var newVersions = new List<FileVersion>();
-
-        foreach (var c in produced)
-        {
-            if (!rootCache.TryGetValue(c.RootId, out var root))
-            {
-                root = _roots.Get(c.RootId);
-                rootCache[c.RootId] = root;
-            }
-            if (root is null) continue;
-
-            var maxSize = root.MaxFileSizeBytes > 0 ? root.MaxFileSizeBytes : _settings.MaxStoreFileSizeBytes;
-
-            var beforeResult = ContentWriter.Store(c.Before, c.RelativePath, maxSize);
-            var afterResult = ContentWriter.Store(c.After, c.RelativePath, maxSize);
-
-            var ev = new FileEvent
-            {
-                RootId = c.RootId,
-                TimestampUtc = c.FirstUtc,
-                TimestampLocal = c.FirstUtc.ToLocalTime(),
-                Operation = c.Operation,
-                Kind = c.Kind,
-                RelativePath = c.RelativePath,
-                OldRelativePath = c.OldRelativePath,
-                SizeBefore = c.Before?.Size ?? beforeResult.Size,
-                SizeAfter = c.After?.Size ?? afterResult.Size,
-                HashBefore = beforeResult.Hash ?? c.Before?.Hash,
-                HashAfter = afterResult.Hash ?? c.After?.Hash,
-                ObjectIdBefore = beforeResult.ObjectId,
-                ObjectIdAfter = afterResult.ObjectId,
-                MtimeBeforeUtc = c.Before?.MtimeUtc,
-                MtimeAfterUtc = c.After?.MtimeUtc,
-                SuppressedCount = c.SuppressedCount,
-                MergeCount = 1,
-                IsCoalesced = c.SuppressedCount > 0,
-                IsTransient = c.IsTransient,
-                Source = "ReadDirectoryChangesW",
-                Note = ComposeNote(c, beforeResult, afterResult),
-            };
-
-            if (c.Kind == EntryKind.Directory && ev.Operation is OperationType.Deleted or OperationType.Renamed or OperationType.Moved)
-            {
-                ev.AffectedDescendantCount = CountDescendants(c);
-            }
-
-            if (_settings.EnableProcessAttribution && !c.IsTransient)
-            {
-                ApplyAttribution(ev, root);
-            }
-
-            events.Add(ev);
-        }
-
-        if (events.Count == 0) return;
-
-        _events.AppendRange(events);
-
-        // 事件已入库（带 Id），此时再更新索引与版本
-        foreach (var ev in events)
-        {
-            UpdateIndex(ev);
-            AddVersionIfNeeded(ev, newVersions);
-            _dirtySince[ev.RootId] = ev.TimestampUtc;
-            _eventsSinceSnapshot[ev.RootId] = _eventsSinceSnapshot.TryGetValue(ev.RootId, out var n) ? n + 1 : 1;
-
-            if (_states.TryGetValue(ev.RootId, out var state))
-            {
-                state.LastEventUtc = ev.TimestampUtc;
-                state.EventCount++;
-            }
-            _roots.TouchLastEvent(ev.RootId, ev.TimestampUtc);
-        }
-
-        if (newVersions.Count > 0) _versions.InsertRange(newVersions);
-
-        Statistics.EventsPersisted += events.Count;
-        Statistics.UnsavedEvents = _merger.PendingCount;
-        Statistics.LastEventUtc = events[^1].TimestampUtc;
-        Statistics.LastFlushUtc = _clock.UtcNow;
-
-        TimelineChanged?.Invoke();
-    }
-
-    private string? ComposeNote(CoalescedEvent c, ContentWriter.StoreResult before, ContentWriter.StoreResult after)
-    {
-        var parts = new List<string>();
-        if (!string.IsNullOrEmpty(c.Note)) parts.Add(c.Note);
-
-        if (c.Operation == OperationType.Deleted && c.Kind == EntryKind.File && before.ObjectId is null && !c.IsTransient)
-        {
-            parts.Add(before.Problem ?? "变化前的内容未留存，此删除无法恢复");
-        }
-
-        if (after.Problem is not null && c.Operation != OperationType.Deleted)
-        {
-            parts.Add(after.Problem);
-        }
-
-        if (c.SuppressedCount > 0)
-        {
-            parts.Add($"已合并 {c.SuppressedCount} 次重复通知");
-        }
-
-        return parts.Count == 0 ? null : string.Join("；", parts);
-    }
-
-    private int CountDescendants(CoalescedEvent c)
-    {
-        // 该操作影响面：目录自身的子项数量（用于 UI 提示"影响 N 个子项"）
-        var target = c.Operation == OperationType.Deleted ? c.RelativePath : (c.OldRelativePath ?? c.RelativePath);
-        try
-        {
-            return _index.ListUnder(c.RootId, target).Count(e => !PathUtil.Comparer.Equals(e.RelativePath, target));
-        }
-        catch (Exception)
-        {
-            return 0;
-        }
-    }
-
-    private void ApplyAttribution(FileEvent ev, WatchedRoot root)
-    {
-        try
-        {
-            var candidates = ((ProcessProbe)_processProbe).FindNearbyCandidates(ev.TimestampUtc, _settings.AttributionWindowMs);
-            if (candidates.Count == 0) return;
-
-            // 先试内核级证据（大多数情况下拿不到，这正是要如实标注的原因）
-            ProcessAttribution? best = null;
-            if (ev.Kind == EntryKind.File && ev.Operation is OperationType.Modified or OperationType.Created)
-            {
-                var absolute = PathUtil.ToAbsolute(root.Path, ev.RelativePath);
-                best = _processProbe.TryFindHandleOwner(absolute, candidates);
-            }
-
-            best ??= candidates[0];
-            ev.Attribution = best;
-            ev.AttributedPid = best.Pid;
-            ev.AttributedProcess = best.ProcessName;
-            ev.Confidence = best.Confidence;
-        }
-        catch (Exception)
-        {
-            // 归属失败不能影响事件本身的可靠性
-        }
-    }
-
-    private void UpdateIndex(FileEvent ev)
-    {
-        var now = ev.TimestampUtc;
-
-        switch (ev.Operation)
-        {
-            case OperationType.Created:
-            case OperationType.Modified:
-            {
-                var existing = _index.Get(ev.RootId, ev.RelativePath);
-
-                // ── 关键修正（真实缺陷，由测试暴露）──
-                // 若这一次没能采到"变化后"的内容（文件刚好在此期间消失/被锁），
-                // 绝不能把索引里已知的 hash/object_id 覆盖成 NULL：
-                // 那会让"这个文件的当前版本"凭空消失，随后它的删除就变成"无法恢复"。
-                // 规则：没有新内容时保留旧内容引用，只更新时间戳。
-                bool hasNewContent = ev.HashAfter is not null || ev.SizeAfter is not null;
-                bool keepExistingContent = existing is { IsDeleted: false } && !hasNewContent;
-
-                _index.Upsert(ev.RootId, new IndexEntry
-                {
-                    RootId = ev.RootId,
-                    RelativePath = ev.RelativePath,
-                    Kind = ev.Kind,
-                    Size = keepExistingContent ? existing!.Size : ev.SizeAfter ?? 0,
-                    Hash = keepExistingContent ? existing!.Hash : ev.HashAfter,
-                    ObjectId = keepExistingContent ? existing!.ObjectId : ev.ObjectIdAfter,
-                    MtimeUtc = ev.MtimeAfterUtc ?? existing?.MtimeUtc ?? now,
-                    FirstSeenUtc = existing?.FirstSeenUtc ?? now,
-                    LastChangedUtc = now,
-                    LastEventId = ev.Id,
-                });
-                break;
-            }
-
-            case OperationType.Deleted:
-            {
-                if (ev.Kind == EntryKind.Directory)
-                {
-                    _index.MarkSubtreeDeleted(ev.RootId, ev.RelativePath, now);
-                }
-                else
-                {
-                    _index.MarkDeleted(ev.RootId, ev.RelativePath, now);
-                }
-                break;
-            }
-
-            case OperationType.Renamed:
-            case OperationType.Moved:
-            {
-                var oldPath = ev.OldRelativePath;
-                if (string.IsNullOrEmpty(oldPath))
-                {
-                    // 没有旧路径的"重命名"只能按同路径更新处理
-                    goto case OperationType.Modified;
-                }
-
-                if (ev.Kind == EntryKind.Directory)
-                {
-                    _index.MoveSubtree(ev.RootId, oldPath, ev.RelativePath, now);
-                }
-                else
-                {
-                    var before = _index.Get(ev.RootId, oldPath);
-                    _index.MarkDeleted(ev.RootId, oldPath, now);
-                    _index.Upsert(ev.RootId, new IndexEntry
-                    {
-                        RootId = ev.RootId,
-                        RelativePath = ev.RelativePath,
-                        Kind = ev.Kind,
-                        Size = ev.SizeAfter ?? before?.Size ?? 0,
-                        Hash = ev.HashAfter ?? before?.Hash,
-                        ObjectId = ev.ObjectIdAfter ?? before?.ObjectId,
-                        MtimeUtc = ev.MtimeAfterUtc ?? before?.MtimeUtc ?? now,
-                        FirstSeenUtc = before?.FirstSeenUtc ?? now,
-                        LastChangedUtc = now,
-                        LastEventId = ev.Id,
-                    });
-                }
-                break;
-            }
-
-            case OperationType.Transient:
-                // 瞬时事件不改变"当前状态"（文件已经不在了），只留事实
-                break;
-        }
-    }
-
-    private void AddVersionIfNeeded(FileEvent ev, List<FileVersion> sink)
-    {
-        if (ev.Kind != EntryKind.File) return;
-
-        // "变化后"的内容成为新版本
-        if (ev.Operation is OperationType.Created or OperationType.Modified or OperationType.Renamed or OperationType.Moved)
-        {
-            if (ev.HashAfter is null) return;
-            sink.Add(new FileVersion
-            {
-                RootId = ev.RootId,
-                RelativePath = ev.RelativePath,
-                Hash = ev.HashAfter,
-                ObjectId = ev.ObjectIdAfter,
-                Size = ev.SizeAfter ?? 0,
-                RecordedUtc = ev.TimestampUtc,
-                RecordedLocal = ev.TimestampLocal,
-                MtimeUtc = ev.MtimeAfterUtc,
-                EventId = ev.Id,
-                Note = ev.Operation.ToChinese(),
-            });
-        }
-
-        // "变化前"的内容也登记一次（这是"恢复被删除文件"的依据）
-        if (ev.Operation == OperationType.Deleted && ev.HashBefore is not null)
-        {
-            sink.Add(new FileVersion
-            {
-                RootId = ev.RootId,
-                RelativePath = ev.RelativePath,
-                Hash = ev.HashBefore,
-                ObjectId = ev.ObjectIdBefore,
-                Size = ev.SizeBefore ?? 0,
-                RecordedUtc = ev.TimestampUtc,
-                RecordedLocal = ev.TimestampLocal,
-                MtimeUtc = ev.MtimeBeforeUtc,
-                EventId = ev.Id,
-                Note = "删除前的内容",
-            });
-        }
-    }
-
+    // 事件落库 + 索引维护已下沉到 WatchEventPipeline（见 WatchEventPipeline.cs）：
+    // 本类只负责在调度线程上把"合并结果"交给它，然后更新自己的运行状态。
     // ─────────────────────────────────────────────────────────────────────
     // 自动快照
     // ─────────────────────────────────────────────────────────────────────
@@ -850,7 +635,7 @@ public sealed class WatchService : IDisposable
 
         foreach (var root in _roots.ListEnabled())
         {
-            int pending = _eventsSinceSnapshot.TryGetValue(root.Id, out var n) ? n : 0;
+            int pending = PendingSnapshotEvents(root.Id);
             if (pending < Math.Max(1, _settings.AutoSnapshotMinEvents)) continue;
 
             var latest = _snapshots.GetAtOrBefore(root.Id, now);
@@ -863,7 +648,7 @@ public sealed class WatchService : IDisposable
             try
             {
                 _snapshots.Create(root.Id, SnapshotKind.Auto, $"自动恢复点（{pending} 条变化）");
-                _eventsSinceSnapshot[root.Id] = 0;
+                ResetEventCount(root.Id);
                 TimelineChanged?.Invoke();
             }
             catch (Exception ex)
@@ -1108,7 +893,7 @@ public sealed class WatchService : IDisposable
         }
         var baseline = _snapshots.Create(root.Id, SnapshotKind.Baseline, "添加保护时建立的初始基线", forceFull: true);
         _roots.SetBaselineSnapshot(root.Id, baseline.Id);
-        _eventsSinceSnapshot[root.Id] = 0;
+        ResetEventCount(root.Id);
 
         Log("info", $"基线已建立（快照 #{baseline.Id}：{baseline.FileCount} 个文件 / {baseline.DirectoryCount} 个目录）", root.Id);
         TimelineChanged?.Invoke();
@@ -1209,13 +994,28 @@ public sealed class WatchService : IDisposable
         TimelineChanged?.Invoke();
     }
 
-    public IReadOnlyList<RootRuntimeState> GetStates() => _states.Values.OrderBy(s => s.RootId).ToList();
+    /// <summary>
+    /// 全部受保护范围的运行时状态（界面与 CLI 都直接调它）。
+    /// 必须在 _gate 内枚举：调度线程可能正在新增/删除状态对象，
+    /// 无锁枚举 Dictionary.Values 会抛"集合已被修改"。
+    /// </summary>
+    public IReadOnlyList<RootRuntimeState> GetStates()
+    {
+        lock (_gate)
+        {
+            return _states.Values.OrderBy(s => s.RootId).ToList();
+        }
+    }
 
     public RootRuntimeState GetState(long rootId) => State(_roots.Get(rootId) ?? new WatchedRoot { Id = rootId });
 
     private RootRuntimeState State(WatchedRoot root)
     {
-        if (_states.TryGetValue(root.Id, out var state)) return state;
+        // 字典探测与写入都用 _gate 保护；中间那次数据库查询留在锁外（它可能慢）。
+        lock (_gate)
+        {
+            if (_states.TryGetValue(root.Id, out var existing)) return existing;
+        }
 
         long count = 0;
         try
@@ -1228,7 +1028,7 @@ public sealed class WatchService : IDisposable
             count = 0;
         }
 
-        state = new RootRuntimeState
+        var state = new RootRuntimeState
         {
             RootId = root.Id,
             RootPath = root.Path,
@@ -1236,8 +1036,14 @@ public sealed class WatchService : IDisposable
             EventCount = count,
             HasBaseline = root.BaselineSnapshotId is not null,
         };
-        _states[root.Id] = state;
-        return state;
+
+        lock (_gate)
+        {
+            // 并发下可能已被别的线程建好：用先到的那个，保证一个根只有一个状态对象
+            if (_states.TryGetValue(root.Id, out var raced)) return raced;
+            _states[root.Id] = state;
+            return state;
+        }
     }
 
     /// <summary>
@@ -1299,9 +1105,23 @@ public sealed class WatchService : IDisposable
             events);
     }
 
+    /// <summary>把某个根的"未进快照事件数"清零（快照建立后 / 重新对齐后 / 退出保护时）。</summary>
+    private void ResetEventCount(long rootId)
+    {
+        lock (_gate)
+        {
+            _eventsSinceSnapshot[rootId] = 0;
+        }
+    }
+
     /// <summary>某个根当前累计的"未进快照"事件数。</summary>
-    public int PendingSnapshotEvents(long rootId) =>
-        _eventsSinceSnapshot.TryGetValue(rootId, out var n) ? n : 0;
+    public int PendingSnapshotEvents(long rootId)
+    {
+        lock (_gate)
+        {
+            return _eventsSinceSnapshot.TryGetValue(rootId, out var n) ? n : 0;
+        }
+    }
 
     /// <summary>监听器内部计数快照（诊断用；生产界面在"运行日志"页展示统计）。</summary>
     public sealed record WatcherInspection(
@@ -1311,7 +1131,7 @@ public sealed class WatchService : IDisposable
     {
         lock (_gate)
         {
-            if (!_watchers.TryGetValue(rootId, out var w)) return null;
+            if (!_registry.TryGet(rootId, out var w) || w is null) return null;
             return new WatcherInspection(w.IsRunning, w.IsPaused, w.ReadCount, w.BatchCount, w.OverflowCount, w.PausedDiscardedCount);
         }
     }
@@ -1340,8 +1160,7 @@ public sealed class WatchService : IDisposable
         List<DirectoryWatcher> watchers;
         lock (_gate)
         {
-            watchers = _watchers.Values.ToList();
-            _watchers.Clear();
+            watchers = _registry.TakeAll();
         }
         foreach (var w in watchers)
         {

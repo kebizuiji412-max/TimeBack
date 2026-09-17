@@ -104,12 +104,18 @@ public sealed class FileIndexRepository : IFileIndex
             if (affected == 0) return;
 
             // 直接做前缀替换更新（避免逐行读出再写回）。
-            // 两种情形分开写清楚，不依赖 SUBSTR 的长度运算（那种写法极易差一位）：
+            // 两种情形分开写清楚，不依赖容易差一位的长度运算：
             //   path_key == 旧前缀      → 直接改成新前缀
-            //   path_key LIKE 旧前缀/%  → 新前缀 + 去掉"旧前缀/"之后的剩余部分
-            // 比较必须用 path_key（path 已被本条语句改写），SUBSTR 是 1 基偏移。
+            //   path_key LIKE 旧前缀/%  → 新前缀 + "去掉旧前缀之后的部分（含那个斜杠）"
+            //
+            // ⚠ 真实缺陷（本轮修复，磁盘级测试暴露）：
+            //   SUBSTR 是 **1 基**偏移。路径形如 "D/a.txt"，'D'=1、'/'=2、'a'=3，
+            //   要保留 "/a.txt" 必须从 L+1 开始取；旧代码写成 L+2，
+            //   于是子项被拼成 "Ea.txt"、"Esub/c.txt" —— **斜杠被吃掉**，
+            //   目录改名后整棵子树的索引路径全部错位（历史里凭空多出幽灵路径）。
+            //   只有"目录改名且目录里有子项"才会触发，文件改名走不到这里。
             var likePattern = LikePrefix(oldKey);            // "前缀/%"
-            var substrOffset = oldKey.Length + 2;            // 跳过 "旧前缀/"
+            var substrOffset = oldKey.Length + 1;            // 1 基：SUBSTR(x, L+1) = "/剩余部分"
 
             _db.NonQuery(
                 "UPDATE files SET " +

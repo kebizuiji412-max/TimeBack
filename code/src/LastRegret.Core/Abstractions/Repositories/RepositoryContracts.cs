@@ -46,7 +46,14 @@ public interface ISnapshotRepository
     /// <summary>取某时刻之前（含）的最后一个快照。</summary>
     Snapshot? GetLatestAtOrBefore(long rootId, DateTime atUtc);
 
-    IReadOnlyList<Snapshot> List(long rootId, int limit = 200);
+    /// <summary>
+    /// 列出某个根的恢复点（按时间倒序，最多 limit 条）。
+    ///
+    /// <paramref name="fromUtc"/> / <paramref name="toUtc"/> 必须**下推到 SQL**：
+    /// 先取最新 limit 条再在内存里过滤，会让"查较早的时间段"永远查不到东西
+    /// （目标记录根本没进前面那 limit 条）。
+    /// </summary>
+    IReadOnlyList<Snapshot> List(long rootId, int limit = 200, DateTime? fromUtc = null, DateTime? toUtc = null);
 
     IReadOnlyList<SnapshotFile> LoadFiles(long snapshotId);
 
@@ -76,6 +83,15 @@ public interface IFileVersionRepository
     IReadOnlyList<FileVersion> ListForPath(long rootId, string relativePath, int limit = 200);
 
     FileVersion? GetLatestBefore(long rootId, string relativePath, DateTime atUtc);
+
+    /// <summary>
+    /// 批量找出"需要新增历史版本"的快照文件——**一次查询完成**，
+    /// 用于替代"对快照里的每个文件各调用一次 <see cref="GetLatestBefore"/> 的 N+1 查询"。
+    ///
+    /// 判定与逐条查询 + hash 比较完全等价：该路径在 <paramref name="atUtc"/>（含该时刻）
+    /// 之前**最新**的那条历史版本，若不存在、或 hash 与快照中的 hash 不同，则该文件需要登记。
+    /// </summary>
+    IReadOnlyList<SnapshotFile> FindFilesNeedingVersion(long rootId, long snapshotId, DateTime atUtc);
 
     FileVersion? GetById(long id);
 

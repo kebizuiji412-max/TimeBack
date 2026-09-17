@@ -15,6 +15,15 @@ namespace LastRegret.Engine;
 public sealed class RestoreOutcome
 {
     public bool Ok { get; init; }
+
+    /// <summary>
+    /// 本次执行是**被拒绝**的（而不是执行失败）：计划已过期、指纹不匹配等。
+    ///
+    /// 语义差别很重要（FINAL-WB-001）：拒绝意味着"什么都没做，请重新预览"，
+    /// 失败意味着"试着做了但没成功"。CLI 必须把前者映射成 rejected，不能映射成 success。
+    /// </summary>
+    public bool Rejected { get; init; }
+
     public long OperationId { get; init; }
     public RestoreStatus Status { get; init; }
     public int Succeeded { get; init; }
@@ -305,12 +314,27 @@ public sealed class RestoreEngine
         if (root is null) return Fail(0, "受保护范围不存在。");
 
         // ── 规则 1：确认的必须是同一份预览 ──
+        //
+        // ⚠ 真实缺陷（本轮修复，FINAL-WB-001）：这道校验原先形同虚设 ——
+        //   plan.Fingerprint 与 confirmFingerprint 通常来自**同一个对象**，而"重算"用的也是
+        //   同一个内存 plan，于是永远相等。它唯一能查出的是"历史在这期间被清理过"。
+        //   真正让这道校验生效的是 **ComputeFingerprint 现在把预览时刻的磁盘哈希
+        //   （RestoreStep.ExpectedCurrentHash）算了进去**，配合执行入口"用同样的输入
+        //   重新生成一份计划再比对指纹"（见 AgentCommands.ExecuteRestore / UI 的重新预览），
+        //   磁盘在预览之后被改过时新计划的期望哈希不同 → 指纹必然不同 → 在这里被如实拒绝。
+        //   注意这里**没有**放宽任何东西，也没有新增"跳过校验"的开关。
         if (!string.Equals(plan.Fingerprint, confirmFingerprint, StringComparison.Ordinal))
         {
             plan.ComputeFingerprint();
             if (!string.Equals(plan.Fingerprint, confirmFingerprint, StringComparison.Ordinal))
             {
-                return Fail(0, "预览内容已发生变化（历史可能在这期间被清理），请重新预览后再确认。");
+                // 指纹现在绑定了"预览那一刻磁盘上的内容哈希"，因此走到这里有两种可能：
+                //   · 磁盘在预览之后被改过（新计划的期望哈希不同）；
+                //   · 计划本身变了（历史/目标在这期间被清理或改变）。
+                // 不硬猜是哪一种，但要把两者都如实说出来，并给出唯一正确的下一步。
+                return Fail(0,
+                    "这次预览已经失效：磁盘内容或历史在预览之后发生了变化，为避免覆盖新内容已拒绝执行。" +
+                    "请重新预览后再确认。");
             }
         }
 
@@ -322,6 +346,16 @@ public sealed class RestoreEngine
         if (!allowNewRemovals && plan.ConfirmationCount > 0)
         {
             return Fail(0, $"有 {plan.ConfirmationCount} 个条目需要您明确确认（删除目标时刻之后新增的文件），请先勾选确认。");
+        }
+
+        // ── 计划过期检查：必须在建安全点与恢复记录**之前**（FINAL-WB-001）──
+        // 预览之后磁盘又被改过的话，这份计划已经不等价了。旧实现会一路执行下去、
+        // 把每一步"冲突跳过"，最后报 completed 成功并留下 operation 与快照 —— 协议上错。
+        var staleReason = FindStalePlanReason(root, plan);
+        if (staleReason is not null)
+        {
+            log?.Invoke(staleReason);
+            return Fail(0, staleReason, rejected: true);
         }
 
         // ── 规则 2：执行前必须有一个完整的安全点 ──
@@ -362,29 +396,60 @@ public sealed class RestoreEngine
 
             var stepRecords = _restoreRepo.ListSteps(operation.Id);
             var bySeq = stepRecords.ToDictionary(s => s.Sequence);
-            int sequence = 0;
+
+            // 步骤记录是**按计划顺序**预先落库的，所以执行时传给 ExecuteStep 的序号
+            // 必须是该步骤在计划里的下标，而不是"第几个被执行"。
+            // （类型变化那一段需要乱序执行，用自增计数器会把结果记到错误的步骤行上。）
+            var indexOf = new Dictionary<RestoreStep, int>(ReferenceEqualityComparer.Instance);
+            for (var i = 0; i < plan.Steps.Count; i++) indexOf[plan.Steps[i]] = i;
+
+            // ── 类型冲突（文件 ↔ 目录）必须先"移除旧形态"再"建立新形态" ──
+            //
+            // ⚠ 真实缺陷（本轮修复）：下面固定的执行顺序是
+            //    建目录 → 恢复内容 → 删路径 → 删目录，
+            //   而磁盘上同一个路径可能正处在**另一种类型**上（目标要写文件、磁盘上却是目录，
+            //   或者反过来）。这时"先建后删"必然失败：往目录路径上写文件、往文件路径上建目录，
+            //   于是恢复报失败、最终磁盘状态不等于目标状态。
+            //   这里把"需要类型重置的路径（及其子树）"上的移除步骤提前执行；
+            //   其余移除步骤仍然保持在恢复内容之后 —— 原有的"先写回、后删除"安全顺序不变。
+            var typeReset = CollectTypeResetPaths(root, plan);
+            bool NeedsEarlyRemove(RestoreStep s) =>
+                s.Action is RestoreAction.RemovePath or RestoreAction.RemoveDirectory &&
+                (s.SourceChange == ChangeKind.TypeChanged ||
+                 typeReset.Any(p => PathUtil.Comparer.Equals(p, s.RelativePath) || PathUtil.IsUnder(p, s.RelativePath)));
+
+            var earlyRemovals = plan.Steps.Where(NeedsEarlyRemove).ToList();
+            foreach (var step in earlyRemovals)
+            {
+                Tally(ExecuteStep(root, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
+            }
+            if (earlyRemovals.Count > 0)
+            {
+                log?.Invoke($"类型变化：先移除 {earlyRemovals.Count} 个旧形态的路径，再建立新形态。");
+            }
+            var earlySet = new HashSet<RestoreStep>(earlyRemovals, ReferenceEqualityComparer.Instance);
 
             // 执行顺序：建目录 → 恢复文件内容 → 移除多余路径 → 清理空目录。
             // 顺序很重要：先保证目录存在再写文件；先写回再删除（避免中间态把用户数据置于风险中）。
             foreach (var step in plan.Steps.Where(s => s.Action == RestoreAction.CreateDirectory))
             {
-                Tally(ExecuteStep(root, step, operation.Id, sequence++), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
+                Tally(ExecuteStep(root, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
             }
 
             foreach (var step in plan.Steps.Where(s => s.Action == RestoreAction.RestoreContent))
             {
-                Tally(ExecuteStep(root, step, operation.Id, sequence++), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
+                Tally(ExecuteStep(root, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
             }
 
-            foreach (var step in plan.Steps.Where(s => s.Action == RestoreAction.RemovePath))
+            foreach (var step in plan.Steps.Where(s => s.Action == RestoreAction.RemovePath && !earlySet.Contains(s)))
             {
-                Tally(ExecuteStep(root, step, operation.Id, sequence++), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
+                Tally(ExecuteStep(root, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
             }
 
             // 最后尝试清理空目录（非空目录一律保留并如实报告）
-            foreach (var step in plan.Steps.Where(s => s.Action == RestoreAction.RemoveDirectory))
+            foreach (var step in plan.Steps.Where(s => s.Action == RestoreAction.RemoveDirectory && !earlySet.Contains(s)))
             {
-                Tally(ExecuteStep(root, step, operation.Id, sequence++), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
+                Tally(ExecuteStep(root, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
             }
 
             // 把每一步的执行结果落库（崩溃后据此判断实际做到了哪一步）
@@ -394,41 +459,64 @@ public sealed class RestoreEngine
                 catch (Exception) { /* 单步记账失败不应中断整个恢复 */ }
             }
 
+            // ── "全部因冲突跳过"不是成功（FINAL-WB-001 的第二道防线）──
+            // 预检之外还可能撞上"预检之后、执行之前"的改动（竞态），
+            // 或者调用方拿的是自己构造的、没经过预检的计划。
+            // 一个步骤都没成功、却全部因冲突被跳过 —— 说明当前状态已经与预览时的期望不一致：
+            // 这必须按"拒绝"如实回报，绝不能伪装成 success。
+            var allSkipped = failed == 0 && succeeded == 0 && skipped > 0;
+
             // ── 让索引与磁盘重新对齐（恢复期间监听是暂停的） ──
             log?.Invoke("正在重新对齐索引与磁盘状态…");
             ResyncAfterRestore(root, log);
 
-            log?.Invoke("正在创建恢复后状态点…");
-            var post = _snapshots.Create(root.Id, SnapshotKind.PostRestore,
-                $"恢复到 {plan.TargetTimeLocal:yyyy-MM-dd HH:mm:ss} 之后的状态");
+            // 什么都没执行就没什么"恢复后状态"可言 —— 不制造成功快照语义
+            long? postId = null;
+            if (!allSkipped)
+            {
+                log?.Invoke("正在创建恢复后状态点…");
+                var post = _snapshots.Create(root.Id, SnapshotKind.PostRestore,
+                    $"恢复到 {plan.TargetTimeLocal:yyyy-MM-dd HH:mm:ss} 之后的状态");
+                postId = post.Id;
+            }
 
-            operation.Status = failed == 0
-                ? RestoreStatus.Completed
-                : (succeeded > 0 ? RestoreStatus.PartiallyCompleted : RestoreStatus.Failed);
+            operation.Status = allSkipped
+                ? RestoreStatus.Failed
+                : failed == 0
+                    ? RestoreStatus.Completed
+                    : (succeeded > 0 ? RestoreStatus.PartiallyCompleted : RestoreStatus.Failed);
             operation.SucceededCount = succeeded;
             operation.FailedCount = failed;
-            operation.PostRestoreSnapshotId = post.Id;
+            operation.PostRestoreSnapshotId = postId;
             operation.FinishedUtc = _clock.UtcNow;
-            operation.Message = BuildMessage(succeeded, failed, skipped, failures);
+            operation.Message = allSkipped
+                ? "计划已过期：预览之后磁盘内容又被改动过，所有步骤都被安全跳过，本次没有执行任何操作。请重新预览后再执行。"
+                : BuildMessage(succeeded, failed, skipped, failures);
             _restoreRepo.Update(operation);
 
             log?.Invoke(operation.Message);
 
             // ── "到底动了几个文件"：撤销可用性的依据（只看真正碰内容的动作） ──
             // 只建目录 / 清空目录不算改动 —— 那些不丢内容，不该因此给用户一个撤销入口。
+            // ⚠ 真实缺陷（本轮修复，BB-007）：**因冲突被跳过的步骤也必须排除**。
+            //   跳过步骤的 Success 同样是 true（"安全地什么都没做"），旧写法把它算成
+            //   "真的改了文件"，于是"所有步骤都被跳过、磁盘一点没变"的恢复也会
+            //   打开撤销入口、并让文件变更计数虚高。
             var filesChanged = bySeq.Values.Count(r =>
-                r.Succeeded && r.Action is RestoreAction.RestoreContent or RestoreAction.RemovePath);
+                r.Succeeded && !r.SkippedDueToConflict &&
+                r.Action is RestoreAction.RestoreContent or RestoreAction.RemovePath);
 
             return new RestoreOutcome
             {
-                Ok = failed == 0,
+                Ok = failed == 0 && !allSkipped,
+                Rejected = allSkipped,
                 OperationId = operation.Id,
                 Status = operation.Status,
                 Succeeded = succeeded,
                 Failed = failed,
                 Skipped = skipped,
                 PreSnapshotId = safety.Snapshot.Id,
-                PostSnapshotId = post.Id,
+                PostSnapshotId = postId,
                 Message = operation.Message,
                 FilesChanged = filesChanged,
                 Failures = { },
@@ -548,9 +636,24 @@ public sealed class RestoreEngine
             switch (step.Action)
             {
                 case RestoreAction.CreateDirectory:
+                {
+                    // 类型冲突兜底：目标要建目录，磁盘上却是一个同名文件。
+                    // 正常路径下计划里已经有"移除同名文件"这一步（类型变化），且已被提前执行；
+                    // 这里兜住"索引与磁盘短时不一致、计划里没有那一步"的情形。
+                    // 绝不静默丢内容：先按 RemovePath 的同一套审计链路留存内容，再删除。
+                    if (File.Exists(FileSystemReader.Extend(absolute)))
+                    {
+                        var oldHash = _reader.TryComputeHash(absolute, out _);
+                        record.BeforeHash = oldHash;
+                        record.BeforeSize = new FileInfo(FileSystemReader.Extend(absolute)).Length;
+                        record.BeforeObjectId = _writer.StoreExistingFile(
+                            absolute, step.RelativePath, _settings.MaxStoreFileSizeBytes, out _, out _);
+                        File.Delete(FileSystemReader.Extend(absolute));
+                    }
                     Directory.CreateDirectory(FileSystemReader.Extend(absolute));
                     record.Succeeded = true;
                     return new StepResult { Success = true, Record = record };
+                }
 
                 case RestoreAction.RemoveDirectory:
                 {
@@ -614,6 +717,20 @@ public sealed class RestoreEngine
                         return new StepResult { Success = false, Error = record.Error, Record = record };
                     }
 
+                    // 类型冲突兜底：目标要写文件，磁盘上却是一个同名目录。
+                    // 只在这个目录**已经空了**的时候移除它 —— 它里面该删的子项本来就有各自的
+                    // 移除步骤，而且那种情况下它们会被提前执行；非空一律如实失败，
+                    // 绝不递归删除没有被计划覆盖过的用户内容。
+                    if (Directory.Exists(FileSystemReader.Extend(absolute)))
+                    {
+                        if (Directory.EnumerateFileSystemEntries(FileSystemReader.Extend(absolute)).Any())
+                        {
+                            record.Error = "该路径当前是一个非空目录（类型变化），里面的内容不在本次计划范围内，出于安全考虑已中止";
+                            return new StepResult { Success = false, Error = record.Error, Record = record };
+                        }
+                        Directory.Delete(FileSystemReader.Extend(absolute), recursive: false);
+                    }
+
                     // 冲突检测：磁盘上的内容是否还是预览时看到的样子？
                     if (File.Exists(FileSystemReader.Extend(absolute)))
                     {
@@ -653,13 +770,72 @@ public sealed class RestoreEngine
         }
     }
 
-    private RestoreOutcome Fail(long operationId, string message) => new()
+    private RestoreOutcome Fail(long operationId, string message, bool rejected = false) => new()
     {
         Ok = false,
+        Rejected = rejected,
         OperationId = operationId,
         Status = RestoreStatus.Failed,
         Message = message,
     };
+
+    /// <summary>
+    /// 计划是否已经过期（预览之后磁盘上的内容又被改动过）。
+    ///
+    /// 只看"本次会覆盖或删除、且预览时确实存在"的文件：把磁盘上现在的内容与
+    /// 预览时记录的期望值比一遍。不一致就说明用户确认的那份计划**已经不等价**了 ——
+    /// 这时必须 rejected：不建安全点、不写恢复记录、不动磁盘，让用户重新预览。
+    ///
+    /// ⚠ 真实缺陷（本轮修复，FINAL-WB-001）：旧实现没有这道检查，
+    ///   执行时每一步都会因冲突被"安全地跳过"，最后却报 completed 成功，
+    ///   还留下 operation 与前后快照 —— 调用方把 success 理解成"已经按计划执行过"。
+    ///
+    /// 文件"已经不存在"不算过期：那只会让这一步变成新建，不存在丢内容的风险。
+    /// </summary>
+    private string? FindStalePlanReason(WatchedRoot root, RestorePlan plan)
+    {
+        var checkable = 0;
+        var stale = new List<string>();
+
+        foreach (var step in plan.Steps)
+        {
+            if (step.Action is not (RestoreAction.RestoreContent or RestoreAction.RemovePath)) continue;
+            if (string.IsNullOrEmpty(step.RelativePath)) continue;
+
+            var expected = plan.Current.Find(step.RelativePath)?.Hash;
+            if (string.IsNullOrEmpty(expected)) continue;      // 预览时它不存在 → 交给执行阶段
+
+            string absolute;
+            try
+            {
+                absolute = PathUtil.ToAbsolute(root.Path, step.RelativePath);
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+
+            if (!File.Exists(FileSystemReader.Extend(absolute))) continue;   // 已经不存在：只会变成新建
+
+            checkable++;
+            var actual = _reader.TryComputeHash(absolute, out _);
+            if (actual is null) continue;                      // 读不了 → 执行阶段会如实失败
+            if (string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase)) continue;
+
+            stale.Add($"{step.RelativePath}（预览时 {expected[..Math.Min(8, expected.Length)]}…，" +
+                      $"现在 {actual[..Math.Min(8, actual.Length)]}…）");
+        }
+
+        // ── 只有"计划里可执行的部分**全部**过期"时才整单拒绝 ──
+        // 那时这份计划已经没有任何可执行内容，继续下去只会把每一步冲突跳过、
+        // 却回报 completed 成功并留下 operation 与前后快照（FINAL-WB-001）。
+        // 混合场景（一部分过期、一部分仍然有效）保持既有语义不变：
+        // 过期的那几步被安全跳过并如实记账，其余照常执行 —— 不因为一步漂移就整单作废。
+        if (checkable == 0 || stale.Count < checkable) return null;
+
+        return $"计划已过期：{stale.Count} 个待改动文件在预览之后又被改过（{string.Join("、", stale.Take(3))}）。" +
+               "这份计划已经不可执行，为避免覆盖新内容，本次恢复已被拒绝；请重新预览并确认后再执行。";
+    }
 
     /// <summary>
     /// 本次执行使用的"当前状态清单"（即用户在预览里看到的那一版）。
@@ -708,18 +884,46 @@ public sealed class RestoreEngine
             var missingList = new List<string>();
             foreach (var path in affected)
             {
-                if (!safetyFiles.TryGetValue(path, out var f)) continue;   // 安全点里没有它 → 无处可丢
-                if (f.ObjectId is null || !_store.Exists(f.ObjectId.Value))
+                if (safetyFiles.TryGetValue(path, out var f))
                 {
-                    missing++;
-                    if (missingList.Count < 5) missingList.Add(f.RelativePath);
+                    if (f.ObjectId is null || !_store.Exists(f.ObjectId.Value))
+                    {
+                        missing++;
+                        if (missingList.Count < 5) missingList.Add(f.RelativePath);
+                    }
+                    continue;
                 }
+
+                // ── 安全点里**根本没有**这个路径 ──
+                //
+                // ⚠ 真实缺陷（本轮修复，BB-015）：这里原先直接 `continue` 放行。
+                //   只要该路径当前**确实是一个文件**，而本次恢复会覆盖或删除它，
+                //   就说明"它的当前内容没有进入安全点" → 执行完 undo 回不到执行前状态。
+                //   分三类，只有第三类必须拒绝：
+                //     A) 磁盘上不存在      → 没有内容会丢，放行
+                //     B) 磁盘上是目录      → 目录没有内容对象，文件内容规则不适用，放行
+                //     C/D) 磁盘上是文件    → 本次会破坏它，而安全点证明不了它的当前内容 → 拒绝
+                //   （"当前文件本来就不可读/不可保存"也落在这类：既然证明不了，就不能假装安全。）
+                string absolute;
+                try
+                {
+                    absolute = PathUtil.ToAbsolute(root.Path, path);
+                }
+                catch (Exception)
+                {
+                    continue;   // 路径本身不合法：交给执行阶段按既有语义如实失败
+                }
+
+                if (!File.Exists(FileSystemReader.Extend(absolute))) continue;   // A / B
+
+                missing++;
+                if (missingList.Count < 5) missingList.Add(path);
             }
 
             if (missing > 0)
             {
                 return (null,
-                    $"本次恢复会影响 {missing} 个文件，但它们当前的内容没有留存下来（例如：{string.Join("、", missingList)}），" +
+                    $"本次恢复会影响 {missing} 个文件，但它们当前的内容没有进入安全点（例如：{string.Join("、", missingList)}），" +
                     "恢复后无法把它们还原，因此已中止。请先等待这些文件产生一次新变化，或调整留存大小上限。");
             }
 
@@ -729,6 +933,32 @@ public sealed class RestoreEngine
         {
             return (null, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// 找出"目标类型与磁盘当前类型不一致"的路径（文件 ↔ 目录）。
+    ///
+    /// 为什么要在执行期判断，而不是只看计划：索引有可能短时落后于磁盘
+    /// （例如目录是随"往里面写文件"隐式创建的，Windows 不一定为它单独报事件），
+    /// 于是计划里这个路径看起来只是"被删除/被新增"，而磁盘上它其实已经换了个类型。
+    /// 这类路径上的移除步骤必须先执行，否则新形态建不出来。
+    /// </summary>
+    private static List<string> CollectTypeResetPaths(WatchedRoot root, RestorePlan plan)
+    {
+        var result = new List<string>();
+        foreach (var step in plan.Steps)
+        {
+            string absolute;
+            try { absolute = PathUtil.ToAbsolute(root.Path, step.RelativePath); }
+            catch (Exception) { continue; }
+
+            bool fileOnDisk = File.Exists(FileSystemReader.Extend(absolute));
+            bool dirOnDisk = Directory.Exists(FileSystemReader.Extend(absolute));
+
+            if (step.Action == RestoreAction.RestoreContent && dirOnDisk) result.Add(step.RelativePath);
+            else if (step.Action == RestoreAction.CreateDirectory && fileOnDisk) result.Add(step.RelativePath);
+        }
+        return result;
     }
 
     /// <summary>

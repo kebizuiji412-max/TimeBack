@@ -41,7 +41,9 @@ public static class TimelineSuites
             box.WriteFile("config.json", "{ \"port\": 8080 }");
             box.WaitForEvent("config.json", OperationType.Created);
 
-            Thread.Sleep(250);
+            // 等"创建"先成为独立事实（600ms：整套测试满载时合并窗口会变慢，
+            // 250ms 会让后面这次修改并进"创建"里，测试就会偶发失败）
+            Thread.Sleep(600);
             box.WriteFile("config.json", "{ \"port\": 9090 }");
             var ev = box.WaitForEvent("config.json", OperationType.Modified);
 
@@ -132,12 +134,14 @@ public static class TimelineSuites
             box.WriteFile("save.txt", "v0");
             box.WaitForEvent("save.txt", OperationType.Created);
 
-            Thread.Sleep(250);
-            // 模拟编辑器一次保存产生的多次写入（真实 VS Code 会连发多个文件系统通知）
+            Thread.Sleep(600);   // 同上：让"创建"先落成独立事实
+            // 模拟编辑器一次保存产生的多次写入（真实 VS Code 会连发多个文件系统通知）。
+            // 连写之间**不插 Sleep**：这里的断言是"一次保存应被合并"，而 Sleep(15) 在
+            // 整套测试满载时会被拉长到上百毫秒，反而把一次保存拆成多次独立变化 ——
+            // 那是测试环境的抖动，不是产品行为。
             for (int i = 1; i <= 6; i++)
             {
                 box.WriteFile("save.txt", $"v{i}");
-                Thread.Sleep(15);
             }
 
             box.WaitFor(() => box.EventsOf("save.txt").Count >= 2, 6000, "至少应有一条修改事件");
@@ -148,8 +152,14 @@ public static class TimelineSuites
             Check.True(modifyEvents.Count >= 1, "应记录修改");
             Check.True(events.Count <= 4,
                 $"连续 6 次保存应被合并，事件数不应爆炸（实际 {events.Count} 条）：\n{box.DescribeEvents()}");
-            Check.True(modifyEvents.Any(e => e.SuppressedCount > 0) || events.Count == 2,
-                $"合并后应有明确的合并计数（实际事件：\n{box.DescribeEvents()}）");
+
+            // 语义更新（FINAL-WB-003）：原先这里断言"必须有 SuppressedCount>0 或恰好 2 条事件"。
+            // 但本轮修复让**强制落库之后不再累计抑制计数**（去重表在 flush 时清空，
+            // 这样"保存时间点之后紧接着的改动"才不会被当成上一条的重复而丢掉）。
+            // 因此"显式抑制计数"不再是可靠观测。真正要守住的不变式是：
+            //   ① 6 次连写被合并（事件数 ≤ 4，上面已断言）；
+            //   ② 最后一次写入的内容必须出现在历史里（下面断言）。
+            Check.True(events.Count >= 2, "创建与修改都应留下历史");
 
             // 最终内容必须是最后一次写入的内容
             var last = events.Last();

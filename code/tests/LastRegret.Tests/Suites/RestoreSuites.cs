@@ -369,8 +369,14 @@ public static class RestoreSuites
 
             var outcome = box.Restore.Execute(plan!, plan!.Fingerprint, allowNewRemovals: true);
             Check.FileExists(box.Abs("doc.txt"), "预览之后被改过的文件不得被删除");
-            Check.True(outcome.Skipped >= 1, "冲突的文件必须被记为「跳过」而不是删掉");
             Check.Equal("v2 用户在预览之后又改了", box.ReadFile("doc.txt"), "内容必须原样保留");
+
+            // 语义更新（FINAL-WB-001）：删除计划里唯一的步骤也过期了 → 整单拒绝，
+            // 而不是"执行一遍再把这一步跳过"。安全结果完全一致（文件没被删），
+            // 而且不再留下一个"成功"的恢复记录。
+            Check.True(outcome.Rejected, $"计划已过期时必须拒绝执行（结果：{outcome.Message}）");
+            Check.Equal(0, outcome.FilesChanged, "拒绝时不得改动任何文件");
+            Check.Equal(0L, outcome.OperationId, "拒绝时不得创建恢复记录");
         });
 
         yield return new("恢复·自定义删除", "恢复与删除混合执行：一个计划里既恢复、又删除", () =>
@@ -475,8 +481,16 @@ public static class RestoreSuites
 
             Check.Equal("预览之后的第二次改动", box.ReadFile("c.txt"),
                 "预览之后被改过的文件必须被跳过，绝不能静默覆盖掉用户的新内容");
-            Check.True(outcome.Skipped > 0 || outcome.Failed > 0,
-                $"应如实报告有条目被跳过（结果：{outcome.Message}）");
+
+            // 语义更新（FINAL-WB-001，本轮修复）：计划里可执行的步骤**全部**过期时，
+            // 整单按"拒绝"处理 —— 不建恢复记录、不建快照、不动磁盘；
+            // 旧断言只要求"报告有条目被跳过"，那正是被验收判定为协议错误的行为。
+            // 安全不变式不变：内容保留 + 明确告知用户发生了什么。
+            Check.True(outcome.Rejected, $"计划全部过期时必须拒绝（结果：{outcome.Message}）");
+            Check.Equal(0, outcome.Skipped, "整单拒绝时不产生被跳过的步骤记录");
+            Check.Equal(0, outcome.FilesChanged, "拒绝意味着磁盘没有任何改动");
+            Check.False(outcome.CanUndo, "什么都没做，不该提供撤销入口");
+            Check.Equal(0L, outcome.OperationId, "拒绝时不得创建恢复记录");
         });
 
         yield return new("恢复·完整闭环", "重复恢复同一点：第二次应报告无需恢复且不改动磁盘", () =>

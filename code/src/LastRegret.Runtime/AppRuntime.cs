@@ -43,6 +43,15 @@ public sealed class AppRuntime : IDisposable
     public RestoreEngine Restore { get; private init; } = null!;
     public MaintenanceService Maintenance { get; private init; } = null!;
 
+    private TimeBackApplication? _application;
+
+    /// <summary>
+    /// 对外能力门面：**新的外部入口（未来的 CLI / Agent Adapter）应当用它**，
+    /// 而不是继续从这里一个个取内部组件。上面这些组件保留给 WPF 壳与测试，
+    /// 不再为外部入口扩张。
+    /// </summary>
+    public TimeBackApplication Application => _application ??= TimeBackApplication.From(this);
+
     /// <summary>启动自检报告（UI 会在"设置"页原样展示）。</summary>
     public DatabaseHealth Health { get; private init; } = new();
 
@@ -55,6 +64,20 @@ public sealed class AppRuntime : IDisposable
     public bool DataDirectoryIsFallback { get; private set; }
 
     private readonly List<string> _startupNotes = new();
+
+    /// <summary>会话标记的键（放在设置仓库的键值里，不建新表）。</summary>
+    private const string SessionOpenKey = "session.open";
+    private const string SessionOwnerKey = "session.owner_pid";
+
+    private bool _ownsSession;
+
+    /// <summary>
+    /// 上次会话是否**没有正常退出**（进程被强杀 / 崩溃）。
+    ///
+    /// 为 true 表示：启动时已经对所有启用中的保护目录排了后台对账，
+    /// 让 index 重新追上磁盘；界面应当如实显示"正在重新检查"，而不是假装历史可信。
+    /// </summary>
+    public bool PreviousShutdownWasUnclean { get; private set; }
 
     public IReadOnlyList<string> StartupNotes => _startupNotes;
 
@@ -244,6 +267,50 @@ public sealed class AppRuntime : IDisposable
         watch.Start();
         watch.StartWatchingAll();
 
+        // ── 会话标记：上次是否正常退出（本轮修复，FINAL-WB-005 / P1-4）──
+        //
+        // 强杀时 watcher 收件箱里还没落库的事件只存在于内存里，无法挽回 —— 这是客观限制。
+        // 但**磁盘事实**是可以重新对齐的：只要知道"上次不是干净退出"，
+        // 就对所有启用中的保护目录排一次后台对账（rescan），让 index/最新状态重新追上磁盘。
+        //
+        // 只用一个键值（session.open + 占用者 pid），不建表、不持久化事件队列、不改公开 API：
+        //   · open=1 且占用者进程已死 → 上次非正常结束 → 触发对账；
+        //   · open=1 且占用者还活着     → 有另一个实例在跑（GUI 开着时调 CLI）→ 不抢标记；
+        //   · open=0                     → 正常启动，接管标记。
+        try
+        {
+            var open = string.Equals(settingsRepo.GetRaw(SessionOpenKey), "1", StringComparison.Ordinal);
+            var ownerPid = int.TryParse(settingsRepo.GetRaw(SessionOwnerKey), out var pid) ? pid : 0;
+            var ownerAlive = IsProcessAlive(ownerPid);
+
+            if (open && !ownerAlive)
+            {
+                runtime.PreviousShutdownWasUnclean = true;
+                runtime._startupNotes.Add(
+                    "上次没有正常退出：正在后台重新检查受保护目录与磁盘是否一致（不影响你继续使用）。");
+                foreach (var root in roots.ListEnabled())
+                {
+                    watch.RequestRescan(root.Id, "上次没有正常退出，重新对齐磁盘状态");
+                }
+            }
+            else if (open && ownerAlive)
+            {
+                runtime._startupNotes.Add("检测到另一个正在运行的实例，沿用它的会话状态。");
+            }
+
+            if (!open || !ownerAlive)
+            {
+                settingsRepo.SetRaw(SessionOpenKey, "1");
+                settingsRepo.SetRaw(SessionOwnerKey, Environment.ProcessId.ToString());
+                runtime._ownsSession = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            // 会话标记只是"能不能自愈"的辅助信息，读不出来也不该拦住启动
+            runtime._startupNotes.Add("会话状态检查失败：" + ex.Message);
+        }
+
         // 自愈：找出"启用了保护但没有基线"的根（典型成因是首次扫描时用户强杀了进程，
         // 导致监听从未真正开始、时间线永远空白）。这里不静默处理，而是明确告知并
         // 由界面提供一键补齐，避免用户对着空白时间线猜原因。
@@ -276,6 +343,21 @@ public sealed class AppRuntime : IDisposable
         return runtime;
     }
 
+    /// <summary>会话占用者进程是否还活着（用 pid 不足以证明同一进程，但足以区分"上一次已死"）。</summary>
+    private static bool IsProcessAlive(int pid)
+    {
+        if (pid <= 0) return false;
+        try
+        {
+            using var p = System.Diagnostics.Process.GetProcessById(pid);
+            return !p.HasExited;
+        }
+        catch (Exception)
+        {
+            return false;      // 进程不存在 / 无权查询 → 当作已死
+        }
+    }
+
     /// <summary>重新加载设置并应用到各组件（保存设置后调用）。</summary>
     public void ApplySettings(AppSettings settings)
     {
@@ -288,6 +370,20 @@ public sealed class AppRuntime : IDisposable
     {
         try { Watch.Dispose(); }
         catch (Exception) { /* 关闭阶段异常不应中断退出 */ }
+        // Watch.Dispose() 内部会 drain + flush + persist；干净标记必须在它**之后**写，
+        // 否则等于在“还没落库”的时候就宣布这次退出是干净的。
+
+        // 只有"本进程是会话占用者"时才写回干净标记：
+        // 别把另一个仍在运行的实例的会话状态抹掉（那样它一旦被杀就检测不出来了）。
+        if (_ownsSession)
+        {
+            try
+            {
+                SettingsRepository.SetRaw(SessionOpenKey, "0");
+                SettingsRepository.SetRaw(SessionOwnerKey, string.Empty);
+            }
+            catch (Exception) { /* 退出阶段失败不应中断 */ }
+        }
 
         try { Store.Dispose(); }
         catch (Exception) { }

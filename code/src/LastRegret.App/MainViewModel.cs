@@ -21,6 +21,24 @@ public sealed class MainViewModel : ObservableObject
 {
     private readonly AppRuntime _rt;
 
+    /// <summary>
+    /// 恢复流程协调器：预览 / 自定义恢复集合合并 / 执行 / 撤销 / 恢复记录都在它里面。
+    /// 本视图模型不再直接调用 RestoreEngine —— 只负责把结果变成界面能显示的东西。
+    /// </summary>
+    private readonly RestoreCoordinator _restoreFlow;
+
+    /// <summary>
+    /// 保护范围协调器：登记/移除/暂停/重新扫描/基线扫描与扫描作用域都在它里面。
+    /// 本视图模型不再直接调用 WatchService（含它的引擎事件订阅）。
+    /// </summary>
+    private readonly ProtectionCoordinator _protection;
+
+    /// <summary>
+    /// 历史协调器：变化记录 / 历史版本 / 内容差异的读取都在它里面。
+    /// 本视图模型只负责把这些模型变成界面行。
+    /// </summary>
+    private readonly HistoryCoordinator _history;
+
     private string _activePage = "home";
     private string _statusText = "正在初始化…";
 
@@ -66,12 +84,12 @@ public sealed class MainViewModel : ObservableObject
     private string _storageSummary = string.Empty;
     private string _cleanupPreview = string.Empty;
 
-    /// <summary>正在后台建立基线的根（防止重复启动扫描）。</summary>
-    private readonly HashSet<long> _scanningRoots = new();
-
     public MainViewModel(AppRuntime runtime)
     {
         _rt = runtime;
+        _restoreFlow = new RestoreCoordinator(runtime.Application, runtime.Restore, runtime.SnapshotService);
+        _protection = new ProtectionCoordinator(runtime.Watch, runtime.Roots);
+        _history = new HistoryCoordinator(runtime.Application, runtime.Events, runtime.Versions, runtime.Compare);
         UiDispatch.Initialize(System.Windows.Application.Current.Dispatcher);
 
         NavigateCommand = new DelegateCommand(p => Navigate(p as string ?? "timeline"));
@@ -84,7 +102,7 @@ public sealed class MainViewModel : ObservableObject
         RemoveRootRowCommand = new DelegateCommand(p => RemoveRootRow(p as RootRow), p => p is RootRow);
         PauseRootCommand = new DelegateCommand(TogglePauseRoot, () => _selectedRoot is not null);
         RescanRootCommand = new DelegateCommand(RescanRoot, () => _selectedRoot is not null);
-        CancelScanCommand = new DelegateCommand(CancelScan, () => _selectedRoot is not null && _scanningRoots.Contains(_selectedRoot.Id));
+        CancelScanCommand = new DelegateCommand(CancelScan, () => _selectedRoot is not null && _protection.IsScanning(_selectedRoot.Id));
         RefreshHistoryCommand = new DelegateCommand(() => { RefreshRestoreHistory(); ReloadPoints(); });
         SaveSettingsCommand = new DelegateCommand(SaveSettings);
         PlanCleanupCommand = new DelegateCommand(PlanCleanup);
@@ -131,8 +149,8 @@ public sealed class MainViewModel : ObservableObject
         ClearAllDataCommand = new DelegateCommand(ClearAllData);
         ShowLogCommand = new DelegateCommand(() => Navigate("log"));
 
-        _rt.Watch.TimelineChanged += () => { _timelineDirty = true; Raise(nameof(StatusText)); };
-        _rt.Watch.Logged += entry => UiDispatch.Invoke(() =>
+        _protection.TimelineChanged += () => { _timelineDirty = true; Raise(nameof(StatusText)); };
+        _protection.Logged += entry => UiDispatch.Invoke(() =>
         {
             Logs.Insert(0, new LogRow { Utc = entry.Utc, Level = entry.Level, Message = entry.Message });
             while (Logs.Count > 200) Logs.RemoveAt(Logs.Count - 1);
@@ -325,13 +343,13 @@ public sealed class MainViewModel : ObservableObject
     private void LoadRoots()
     {
         Roots.Clear();
-        foreach (var root in _rt.Roots.ListAll())
+        foreach (var root in _protection.ListRoots())
         {
             Roots.Add(new RootRow
             {
                 Root = root,
                 Enabled = root.Enabled,
-                Watching = _rt.Watch.GetState(root.Id).Watching,
+                Watching = _protection.GetState(root.Id).Watching,
                 LastEventUtc = root.LastEventUtc,
             });
         }
@@ -363,10 +381,10 @@ public sealed class MainViewModel : ObservableObject
         {
             try
             {
-                var (_, _, last24) = _rt.Events.GetStatistics(row.Id);
-                var root = _rt.Roots.Get(row.Id);
-                var state = _rt.Watch.GetState(row.Id);
-                var health = _rt.Watch.DescribeRootHealth(row.Id);
+                var (_, _, last24) = _history.GetEventStatistics(row.Id);
+                var root = _protection.GetRoot(row.Id);
+                var state = _protection.GetState(row.Id);
+                var health = _protection.DescribeRootHealth(row.Id);
 
                 row.RefreshStats(last24, root?.LastEventUtc);
                 row.Watching = state.Watching;
@@ -420,7 +438,7 @@ public sealed class MainViewModel : ObservableObject
         if (string.IsNullOrWhiteSpace(path)) return;
 
         // 第一步：登记 + 立即开始监听（很快，不阻塞界面）
-        var (ok, rootId, message) = _rt.Watch.RegisterRoot(path);
+        var (ok, rootId, message) = _protection.RegisterRoot(path);
         if (!ok)
         {
             LastErrorBanner = message;
@@ -453,7 +471,7 @@ public sealed class MainViewModel : ObservableObject
             string? error = null;
             try
             {
-                estimate = _rt.Watch.EstimateScanScope(rootId);
+                estimate = _protection.EstimateScanScope(rootId);
             }
             catch (Exception ex)
             {
@@ -481,16 +499,16 @@ public sealed class MainViewModel : ObservableObject
                 // 把它到底要花多久、占多少空间、哪些文件能恢复，原原本本告诉用户
                 var cannotRestore = estimate.Mode == ProtectionMode.TrackOnly;
                 var message =
-                    "建立基线前的规模评估\n\n" +
+                    "开始保护前的规模评估\n\n" +
                     estimate.Describe() + "\n\n" +
                     (cannotRestore
                         ? "⚠ 当前是「只记录变化」模式：能告诉你发生了什么变化，但不能把文件内容还原回去。\n" +
                           "　如需要内容恢复能力，请先到「设置」页改为「智能留存」或「完整内容」。\n\n"
                         : "扫描在后台进行，界面可正常使用，随时可点「取消扫描」。\n" +
                           "取消后已扫描的部分有效，点「重新扫描补齐」可继续（已扫描过的文件会跳过，更快）。\n\n") +
-                    "现在开始建立基线吗？（选「否」= 目录已加入保护但暂不建立基线，之后可手动补齐）";
+                    "现在开始准备保护吗？（选「否」= 目录已加入保护范围但暂不扫描，之后可手动补齐）";
 
-                var answer = DangerBox.Show( message, "建立基线前的规模评估",
+                var answer = DangerBox.Show( message, "开始保护前的规模评估",
                     System.Windows.MessageBoxButton.YesNo);
 
                 if (answer == System.Windows.MessageBoxResult.Yes)
@@ -499,7 +517,7 @@ public sealed class MainViewModel : ObservableObject
                 }
                 else
                 {
-                    SetStatusNote("已加入保护范围但未建立基线：请在设置页点「重新扫描补齐」，否则这段时间的变化不会被记录。", 15);
+                    SetStatusNote("已加入保护范围但还没有准备保护：请在设置页点「重新扫描补齐」，否则这段时间的变化不会被记录。", 15);
                     RefreshAll();
                 }
             });
@@ -518,7 +536,7 @@ public sealed class MainViewModel : ObservableObject
         IReadOnlyList<LastRegret.Core.Model.WatchedRoot> missing;
         try
         {
-            missing = _rt.Watch.FindRootsMissingBaseline();
+            missing = _protection.FindRootsMissingBaseline();
         }
         catch (Exception)
         {
@@ -527,7 +545,7 @@ public sealed class MainViewModel : ObservableObject
 
         foreach (var root in missing)
         {
-            if (_scanningRoots.Contains(root.Id)) continue;
+            if (_protection.IsScanning(root.Id)) continue;
             StartBaselineScan(root.Id, 0, skipConfirm: true);
         }
     }
@@ -536,14 +554,13 @@ public sealed class MainViewModel : ObservableObject
     private void StartBaselineScan(long rootId, int estimatedTotal = 0, bool skipConfirm = false)
     {
         _ = skipConfirm;
-        if (_scanningRoots.Contains(rootId))
+        // 扫描作用域（含取消源）由保护协调器托管：已经开始就直接返回，不重复启动。
+        if (!_protection.TryBeginScan(rootId, out var scanToken))
         {
-            SetStatusNote("该目录正在建立基线，请等待完成，或点击「取消扫描」。", 30);
+            SetStatusNote("该目录正在准备保护，请等待完成，或点击「取消扫描」。", 30);
             return;
         }
 
-        _scanningRoots.Add(rootId);
-        var cts = _rt.Watch.BeginScanScope(rootId);
         var row = Roots.FirstOrDefault(r => r.Id == rootId);
         if (row is not null)
         {
@@ -551,32 +568,32 @@ public sealed class MainViewModel : ObservableObject
             row.ScanNote = estimatedTotal > 0 ? $"正在扫描磁盘…共约 {estimatedTotal:N0} 项" : "正在扫描磁盘…";
         }
 
-        SetStatusNote("正在建立基线（后台扫描，界面可继续操作，可随时取消）…", 30);
+        SetStatusNote("正在准备保护（后台扫描，界面可继续操作，可随时取消）…", 30);
         CommandManager.InvalidateRequerySuggested();
 
         Task.Run(() =>
         {
             try
             {
-                var (files, dirs) = _rt.Watch.RunBaseline(rootId, p =>
+                var (files, dirs) = _protection.RunBaseline(rootId, estimatedTotal, p =>
                 {
                     UiDispatch.Invoke(() =>
                     {
                         if (row is null) return;
-                        row.ScanNote = p.EstimatedTotal > 0
+                        row.ScanNote = p.EstimatedTotal > 0 && p.EstimatedTotal >= p.Processed
                             ? $"正在扫描：{p.Processed:N0}/{p.EstimatedTotal:N0}（{p.Percent:0.#}%）"
                             : $"正在扫描：已处理 {p.Processed:N0} 项";
                         row.ScanTotal = p.EstimatedTotal;
                         row.ScanProgress = p.Processed;
                     });
-                }, cts.Token, estimatedTotal);
+                }, scanToken);
 
                 UiDispatch.Invoke(() =>
                 {
                     var r = Roots.FirstOrDefault(x => x.Id == rootId);
                     if (r is not null) { r.Scanning = false; r.ScanNote = null; r.ScanTotal = 0; r.ScanProgress = 0; }
                     LastErrorBanner = null;
-                    SetStatusNote($"基线已建立：{files} 个文件 / {dirs} 个目录。从现在起的变化都会被记录。", 10);
+                    SetStatusNote($"已准备好保护：{files} 个文件 / {dirs} 个目录。从现在起的变化都会被记录。", 10);
                     _timelineDirty = true;
                     RefreshAll();
                 });
@@ -587,7 +604,7 @@ public sealed class MainViewModel : ObservableObject
                 {
                     var r = Roots.FirstOrDefault(x => x.Id == rootId);
                     if (r is not null) { r.Scanning = false; r.ScanNote = null; r.ScanTotal = 0; r.ScanProgress = 0; }
-                    SetStatusNote("基线扫描已取消：已扫描的部分已保存，可随时点「重新扫描补齐」继续。", 12);
+                    SetStatusNote("准备保护已取消：已扫描的部分已保存，可随时点「重新扫描补齐」继续。", 12);
                     RefreshAll();
                 });
             }
@@ -597,18 +614,14 @@ public sealed class MainViewModel : ObservableObject
                 {
                     var r = Roots.FirstOrDefault(x => x.Id == rootId);
                     if (r is not null) { r.Scanning = false; r.ScanNote = null; r.ScanTotal = 0; r.ScanProgress = 0; r.LastError = ex.Message; }
-                    LastErrorBanner = "建立基线失败：" + ex.Message;
+                    LastErrorBanner = "准备保护失败：" + ex.Message;
                     RefreshAll();
                 });
             }
             finally
             {
-                _rt.Watch.EndScanScope(rootId, cts);
-                UiDispatch.Invoke(() =>
-                {
-                    _scanningRoots.Remove(rootId);
-                    CommandManager.InvalidateRequerySuggested();
-                });
+                _protection.EndScan(rootId);
+                UiDispatch.Invoke(() => CommandManager.InvalidateRequerySuggested());
             }
         });
     }
@@ -616,7 +629,7 @@ public sealed class MainViewModel : ObservableObject
     private void CancelScan()
     {
         if (_selectedRoot is null) return;
-        _rt.Watch.CancelScan(_selectedRoot.Id);
+        _protection.CancelScan(_selectedRoot.Id);
         SetStatusNote("正在取消扫描…已扫描的部分会保存下来。", 8);
     }
 
@@ -627,11 +640,11 @@ public sealed class MainViewModel : ObservableObject
         {
             if (_selectedRoot.Enabled)
             {
-                _rt.Watch.DisableRoot(_selectedRoot.Id);
+                _protection.SetEnabled(_selectedRoot.Id, false);
             }
             else
             {
-                _rt.Watch.EnableRoot(_selectedRoot.Id);
+                _protection.SetEnabled(_selectedRoot.Id, true);
             }
             LoadRoots();
             StatusText = BuildStatus();
@@ -671,7 +684,7 @@ public sealed class MainViewModel : ObservableObject
 
         try
         {
-            _rt.Watch.RemoveRoot(root.Id, deleteHistory: choice == System.Windows.MessageBoxResult.Yes);
+            _protection.RemoveRoot(root.Id, deleteHistory: choice == System.Windows.MessageBoxResult.Yes);
             if (_selectedRoot?.Id == root.Id) _selectedRoot = null;
             ClearBrowseCaches();
             LoadRoots();
@@ -790,7 +803,7 @@ public sealed class MainViewModel : ObservableObject
         List<FileEvent> list;
         try
         {
-            list = _rt.Events.Query(query).ToList();
+            list = _history.QueryEvents(query).ToList();
         }
         catch (Exception ex)
         {
@@ -905,7 +918,7 @@ public sealed class MainViewModel : ObservableObject
         get
         {
             if (_selectedRoot is null) return "请先添加要保护的文件夹。";
-            if (SelectedPoint is null) return "该时间范围内没有恢复点。";
+            if (SelectedPoint is null) return "该时间范围内没有时间点。";
             return $"选中：{SelectedPoint.TimeText} · {SelectedPoint.KindText} · {SelectedPoint.DetailText}";
         }
     }
@@ -955,18 +968,18 @@ public sealed class MainViewModel : ObservableObject
         if (_selectedRoot is null) return;
         try
         {
-            SetStatusNote("正在创建恢复点…", 30);
-            var snapshot = _rt.SnapshotService.Create(_selectedRoot.Id, SnapshotKind.Manual,
+            SetStatusNote("正在保存时间点…", 30);
+            var snapshot = _restoreFlow.CreateSnapshot(_selectedRoot.Id, SnapshotKind.Manual,
                 $"用户手动创建（{DateTime.Now:HH:mm:ss}）");
             // 明确选中"刚建的这个"：用户按下"记下现在的状态"，
             // 紧接着打开恢复页时当然是想看刚刚这一刻，而不是最老的基线。
             ReloadPoints(snapshot.Id);
             LastErrorBanner = null;
-            SetStatusNote($"已创建恢复点 #{snapshot.Id}（{snapshot.FileCount} 个文件 / {snapshot.DirectoryCount} 个目录）", 10);
+            SetStatusNote($"已保存时间点 #{snapshot.Id}（{snapshot.FileCount} 个文件 / {snapshot.DirectoryCount} 个目录）", 10);
         }
         catch (Exception ex)
         {
-            LastErrorBanner = "创建恢复点失败：" + ex.Message;
+            LastErrorBanner = "保存时间点失败：" + ex.Message;
         }
     }
 
@@ -991,7 +1004,7 @@ public sealed class MainViewModel : ObservableObject
         var last = LastUndoableOperationId;
         if (last is null) return;
 
-        var (plan, error) = _rt.Restore.BuildUndoPreview(last.Value);
+        var (plan, error) = _restoreFlow.PreviewUndo(last.Value);
         if (plan is null)
         {
             LastErrorBanner = error;
@@ -1006,8 +1019,7 @@ public sealed class MainViewModel : ObservableObject
             System.Windows.MessageBoxButton.OKCancel);
         if (confirm != System.Windows.MessageBoxResult.OK) return;
 
-        RunRestore(() => _rt.Restore.ExecuteUndo(last.Value, plan.Fingerprint, allowNewRemovals: true,
-            log: null));
+        RunRestore(() => _restoreFlow.ExecuteUndo(last.Value, plan.Fingerprint));
     }
 
     private void RunRestore(Func<RestoreOutcome> action) => RunRestore(action, null);
@@ -1021,7 +1033,7 @@ public sealed class MainViewModel : ObservableObject
         SetStatusNote("正在执行恢复…", 300);
         
         var targetLabel = doneLabel
-                          ?? SelectedPoint?.FriendlyTime
+                          ?? SelectedPoint?.IdentifiedTime
                           ?? string.Empty;
 
         Task.Run(() =>
@@ -1087,14 +1099,14 @@ public sealed class MainViewModel : ObservableObject
         });
     }
 
-    public long? LastUndoableOperationId => _rt.Restore.GetLastUndoable(_selectedRoot?.Id)?.Id;
+    public long? LastUndoableOperationId => _restoreFlow.GetLastUndoable(_selectedRoot?.Id)?.Id;
 
     private void RefreshRestoreHistory()
     {
         RestoreHistory.Clear();
         try
         {
-            foreach (var op in _rt.Restore.ListOperations(_selectedRoot?.Id, 20))
+            foreach (var op in _restoreFlow.ListOperations(_selectedRoot?.Id, 20))
             {
                 RestoreHistory.Add(new RestoreRow(op, OnUndoRequested));
             }
@@ -1118,7 +1130,7 @@ public sealed class MainViewModel : ObservableObject
     /// <summary>为什么"没有可撤销的恢复"——给出可执行的原因，而不是让用户猜。</summary>
     private string DescribeWhyNoUndo()
     {
-        var any = _rt.Restore.ListOperations(_selectedRoot?.Id, 50).ToList();
+        var any = _restoreFlow.ListOperations(_selectedRoot?.Id, 50).ToList();
         if (any.Count == 0)
         {
             return "本保护范围还没有执行过任何恢复（「恢复」页的列表是空的）。";
@@ -1137,7 +1149,7 @@ public sealed class MainViewModel : ObservableObject
 
     private void UndoOperation(long operationId)
     {
-        var (plan, error) = _rt.Restore.BuildUndoPreview(operationId);
+        var (plan, error) = _restoreFlow.PreviewUndo(operationId);
         if (plan is null)
         {
             LastErrorBanner = error;
@@ -1154,8 +1166,7 @@ public sealed class MainViewModel : ObservableObject
             System.Windows.MessageBoxButton.OKCancel);
         if (confirm != System.Windows.MessageBoxResult.OK) return;
 
-        RunRestore(() => _rt.Restore.ExecuteUndo(operationId, plan.Fingerprint, allowNewRemovals: true,
-            log: null));
+        RunRestore(() => _restoreFlow.ExecuteUndo(operationId, plan.Fingerprint));
     }
 
 
@@ -1211,8 +1222,8 @@ public sealed class MainViewModel : ObservableObject
 
         try
         {
-            var (_, _, _) = _rt.Events.GetStatistics(_selectedRoot.Id);
-            var events = _rt.Events.Query(new EventQuery
+            var (_, _, _) = _history.GetEventStatistics(_selectedRoot.Id);
+            var events = _history.QueryEvents(new EventQuery
             {
                 RootId = _selectedRoot.Id,
                 Limit = 4000,
@@ -1281,7 +1292,7 @@ public sealed class MainViewModel : ObservableObject
 
         try
         {
-            var list = _rt.Versions.ListForPath(row.RootId, row.RelativePath, 100);
+            var list = _history.ListVersions(row.RootId, row.RelativePath, 100);
             foreach (var v in list)
             {
                 Versions.Add(new VersionRow
@@ -1332,7 +1343,7 @@ public sealed class MainViewModel : ObservableObject
 
         try
         {
-            var result = _rt.Compare.CompareContent(a?.ObjectId, b?.ObjectId, _selectedFile.RelativePath);
+            var result = _history.CompareContent(a?.ObjectId, b?.ObjectId, _selectedFile.RelativePath);
 
             if (result.IsBinary)
             {
@@ -1590,7 +1601,7 @@ public sealed class MainViewModel : ObservableObject
                 $"历史数据：{PathUtil.FormatBytes(report.TotalHistoryBytes)}" +
                 $"（内容 {PathUtil.FormatBytes(report.ObjectsStoredBytes)} + 数据库 {PathUtil.FormatBytes(report.DatabaseBytes)}）\n" +
                 $"保护范围：{PathUtil.FormatBytes(report.ProtectedBytes)} · {report.ProtectedFileCount} 个文件 / {report.ProtectedDirectoryCount} 个目录\n" +
-                $"历史版本：{report.VersionCount} 条 · 事件：{report.EventCount} 条 · 恢复点：{report.SnapshotCount} 个\n" +
+                $"历史版本：{report.VersionCount} 条 · 文件变化：{report.EventCount} 条 · 时间点：{report.SnapshotCount} 个\n" +
                 $"内容去重节省：{PathUtil.FormatBytes(report.DeduplicatedBytes)}" +
                 (report.ObjectsLogicalBytes > 0 ? $"（实际占用 {report.DedupRatio:P1}）" : string.Empty) + "\n" +
                 $"上限：{PathUtil.FormatBytes(report.QuotaBytes)} · 保留 {report.RetentionDays} 天 · " +
@@ -1628,8 +1639,8 @@ public sealed class MainViewModel : ObservableObject
 
         var confirm = DangerBox.Show(
             _cleanupPlan.Describe() + "\n\n" +
-            "· 所有恢复点（含基线、手动恢复点、恢复前安全点）都会保留，仍然可以恢复到过去。\n" +
-            "· 只删除不被任何恢复点引用的历史内容。\n\n继续吗？",
+            "· 所有时间点（含保护开始时留的、你手动留的、恢复前自动留的）都会保留，仍然可以恢复到过去。\n" +
+            "· 只删除没有被任何时间点引用的历史内容。\n\n继续吗？",
             "确认清理历史",
             System.Windows.MessageBoxButton.OKCancel);
         if (confirm != System.Windows.MessageBoxResult.OK) return;
@@ -1802,7 +1813,7 @@ public sealed class MainViewModel : ObservableObject
 
     private string BuildStatus()
     {
-        var stats = _rt.Watch.Statistics;
+        var stats = _protection.Statistics;
         var watching = Roots.Count(r => r.Watching);
         var paused = Roots.Count(r => !r.Enabled);
         var sb = new System.Text.StringBuilder();
@@ -1830,7 +1841,7 @@ public sealed class MainViewModel : ObservableObject
                     sb.Append(CultureInfo.InvariantCulture, $"（{watching} 个在监听）");
             }
             sb.Append(CultureInfo.InvariantCulture, $" · 已记录 {stats.EventsPersisted} 条变化");
-            if (_scanningRoots.Count > 0) sb.Append(" · 正在准备保护");
+            if (_protection.IsAnyScanning) sb.Append(" · 正在准备保护");
             if (stats.LastEventUtc is not null)
                 sb.Append(CultureInfo.InvariantCulture, $" · 最近一次 {stats.LastEventUtc.Value.ToLocalTime():HH:mm:ss}");
         }
@@ -1885,7 +1896,7 @@ public sealed class MainViewModel : ObservableObject
         get
         {
             if (_selectedRoot is null) return string.Empty;
-            if (_scanningRoots.Contains(_selectedRoot.Id)) return "正在准备保护…";
+            if (_protection.IsScanning(_selectedRoot.Id)) return "正在准备保护…";
             if (!_selectedRoot.Enabled) return "已暂停保护";
             return _selectedRoot.Watching ? "● 正在保护" : "● 已开始保护";
         }
@@ -1893,7 +1904,7 @@ public sealed class MainViewModel : ObservableObject
 
     /// <summary>首页的状态点是否显示为"正常"（用于配色）。</summary>
     public bool HomeProtectHealthy =>
-        _selectedRoot is not null && _selectedRoot.Enabled && !_scanningRoots.Contains(_selectedRoot.Id) &&
+        _selectedRoot is not null && _selectedRoot.Enabled && !_protection.IsScanning(_selectedRoot.Id) &&
         _selectedRoot.Watching;
 
     /// <summary>最近的变化（首页只显示最近几条，完整清单在「历史」）。</summary>
@@ -1932,7 +1943,7 @@ public sealed class MainViewModel : ObservableObject
     public string HomeReadyText => "从现在开始，这个文件夹里的变化会被记录。\n\n你可以正常使用电脑，不需要一直打开这个软件。";
 
     /// <summary>首页是否需要显示"正在准备保护"这一屏。</summary>
-    public bool HomeIsPreparing => _selectedRoot is not null && _scanningRoots.Contains(_selectedRoot.Id);
+    public bool HomeIsPreparing => _selectedRoot is not null && _protection.IsScanning(_selectedRoot.Id);
 
     /// <summary>首页是否需要显示"已开始保护"这一屏（有目录、已扫描完、且首页还没有变化）。</summary>
     public bool HomeIsReady => _selectedRoot is not null && !HomeIsPreparing && !HomeHasRecent;
@@ -2010,7 +2021,7 @@ public sealed class MainViewModel : ObservableObject
     private string _browsePath = string.Empty;
 
     /// <summary>浏览用到的清单缓存：快照 Id → 该时间点的全部条目。</summary>
-    private readonly Dictionary<long, List<ManifestEntry>> _manifestCache = new();
+    private readonly Dictionary<long, IReadOnlyList<ManifestEntry>> _manifestCache = new();
 
     /// <summary>
     /// 目录清单缓存：(时间点, 目录) → 已排好序的条目。
@@ -2067,13 +2078,13 @@ public sealed class MainViewModel : ObservableObject
 
     public string TargetArrowLabel => _targetIsCurrentState ? "恢复到 →" : "恢复回 →";
 
-    /// <summary>左端选中的时间点（下拉框旁边再明确写一次）。</summary>
-    public string FromEndText => _selectedTimePointChoice?.FriendlyTime ?? "（未选）";
+    /// <summary>左端选中的时间点（下拉框旁边再明确写一次：时间 + 身份）。</summary>
+    public string FromEndText => _selectedTimePointChoice?.IdentifiedTime ?? "（未选）";
 
     /// <summary>右端的目标（默认"现在"）。</summary>
     public string TargetEndText => _targetIsCurrentState
         ? "现在"
-        : _selectedTargetPoint?.FriendlyTime ?? "（未选）";
+        : _selectedTargetPoint?.IdentifiedTime ?? "（未选）";
 
     public string RestoreDirectionText => _targetIsCurrentState
         ? $"正在从「{FromEndText}」恢复到「当前状态」"
@@ -2082,7 +2093,7 @@ public sealed class MainViewModel : ObservableObject
     /// <summary>浏览器标题栏：现在是哪个时间点 + 当前目录（面包屑）。</summary>
     public string BrowseHeader => _selectedTimePointChoice is null
         ? "（还没有选择时间点）"
-        : $"{_selectedTimePointChoice.FriendlyTime}　\\{_browsePath}";
+        : $"{_selectedTimePointChoice.IdentifiedTime}　\\{_browsePath}";
 
     public string BrowsePathText => string.IsNullOrEmpty(_browsePath) ? "\\（根目录）" : "\\" + _browsePath;
 
@@ -2105,10 +2116,14 @@ public sealed class MainViewModel : ObservableObject
         {
             var restore = RestorePicked.Count(p => !p.IsDeletion);
             var delete = _deletionPaths.Count;
+            var timePoints = RestorePicked.Where(p => !p.IsDeletion).Select(p => p.SnapshotLabel).Distinct().Count();
+            // 跨时间点勾选是刻意允许的（切时间点不会丢选择），所以这里必须**说清楚**它来自多个时间点，
+            // 不能让用户以为"只恢复当前看到的那一个时间点"。
+            var fromTimePoints = timePoints > 1 ? $"（来自 {timePoints} 个时间点）" : string.Empty;
             if (restore == 0 && delete == 0) return "还没有选择任何文件";
-            if (delete == 0) return $"将恢复 {restore} 个文件";
+            if (delete == 0) return $"将恢复 {restore} 个文件{fromTimePoints}";
             if (restore == 0) return $"将删除 {delete} 个文件";
-            return $"将恢复 {restore} 个文件 · 将删除 {delete} 个文件";
+            return $"将恢复 {restore} 个文件 · 将删除 {delete} 个文件{fromTimePoints}";
         }
     }
 
@@ -2206,7 +2221,7 @@ public sealed class MainViewModel : ObservableObject
 
     /// <summary>
     /// 重建时间点列表并确定选中项。**这是时间点状态的唯一落地处**：
-    ///   · 列表来源：<c>_rt.Compare.ListPoints</c>（引擎已按时间倒序返回）
+    ///   · 列表来源：<c>RestoreCoordinator.ListTimePoints</c>（引擎已按时间倒序返回）
     ///   · 选中项规则（按优先级）：
     ///       ① <see cref="_pendingKeepSnapshotId"/> 指定的快照（调用方明确要求保住它）
     ///       ② 当前已选中的那条（按快照 Id 匹配 —— 列表重建后旧对象已不是同一个实例，
@@ -2228,8 +2243,24 @@ public sealed class MainViewModel : ObservableObject
         {
             if (_selectedRoot is not null)
             {
-                var from = DateTime.UtcNow.AddDays(-Math.Max(_timelineDays, 1));
-                var points = _rt.Compare.ListPoints(_selectedRoot.Id, from);
+                // ⚠ 真实缺陷（P1-2A 修复）：这里原本是
+                //     var from = DateTime.UtcNow.AddDays(-Math.Max(_timelineDays, 1));
+                //   而 _timelineDays **默认就是 1 天** —— 于是只要恢复点超过一天，
+                //   GUI 就再也看不到它：数据库里有、CLI 的 timeline 能列出来、
+                //   指纹也算得出来，用户却在界面上永远够不到。
+                //   （验收实测：GUI 最旧只到 snapshot 59，而 snapshot 6 在 CLI 里
+                //     hasEffect=true、steps=1，完全可用。）
+                //
+                //   历史工具的铁律：**只要恢复点仍然存在（没有被 retention 正常删除），
+                //   用户就必须有办法在界面上选到它。** "最近 N 天"只是浏览习惯，
+                //   不能当成可达性边界 —— 恢复点不是日志，日志可以只显示今天。
+                //
+                //   改为不限时间窗，只保留引擎自己的上限（最近 300 个恢复点，列表仍
+                //   按时间倒序）。用 2000-01-01 作"无下界"哨兵：早于任何可能存在的
+                //   恢复点，又避开 DateTime.MinValue 换算 Unix 时间的边界问题。
+                //   历史页的"最近 N 天"过滤保持不变：那里是变化日志的浏览视图。
+                var from = new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                var points = _restoreFlow.ListTimePoints(_selectedRoot.Id, from);
                 var latest = points.FirstOrDefault();
                 var rows = new List<PointRow>();
 
@@ -2243,15 +2274,13 @@ public sealed class MainViewModel : ObservableObject
                     };
                     try
                     {
-                        var snapshot = _rt.SnapshotsRepo.Get(p.SnapshotId);
-                        if (snapshot is not null)
+                        var info = _restoreFlow.DescribePoint(p.SnapshotId);
+                        if (info is not null)
                         {
-                            var health = _rt.SnapshotService.CheckHealth(snapshot);
-                            var check = _rt.SnapshotService.CanDelete(snapshot);
-                            row.IsSuspect = health.IsSuspect;
-                            row.SuspectReason = health.Reason;
-                            row.CanDelete = check.Allowed;
-                            row.DeleteBlockReason = check.Reason;
+                            row.IsSuspect = info.Value.IsSuspect;
+                            row.SuspectReason = info.Value.SuspectReason;
+                            row.CanDelete = info.Value.CanDelete;
+                            row.DeleteBlockReason = info.Value.DeleteBlockReason;
                         }
                     }
                     catch (Exception)
@@ -2318,16 +2347,14 @@ public sealed class MainViewModel : ObservableObject
     }
 
     /// <summary>把某个时间点的清单装进缓存（同一个快照只读一次）。</summary>
-    private List<ManifestEntry>? LoadManifestEntries(long snapshotId)
+    private IReadOnlyList<ManifestEntry>? LoadManifestEntries(long snapshotId)
     {
         try
         {
             if (_manifestCache.TryGetValue(snapshotId, out var cached)) return cached;
 
-            var snap = _rt.SnapshotsRepo.Get(snapshotId);
-            if (snap is null) return null;
-            var manifest = _rt.SnapshotService.LoadManifest(snap);
-            var list = manifest.Entries.Values.ToList();
+            var list = _restoreFlow.LoadManifestEntries(snapshotId);
+            if (list is null) return null;
             _manifestCache[snapshotId] = list;
             return list;
         }
@@ -2400,7 +2427,7 @@ public sealed class MainViewModel : ObservableObject
                 Size = e.Size,
                 MtimeUtc = e.MtimeUtc,
                 SnapshotId = snapRow.Point.SnapshotId,
-                SnapshotLabel = snapRow.FriendlyTime,
+                SnapshotLabel = snapRow.IdentifiedTime,
             };
             row.PropertyChanged += OnBrowseRowPropertyChanged;
             rows.Add(row);
@@ -2573,7 +2600,7 @@ public sealed class MainViewModel : ObservableObject
         var confirm = DangerBox.Show(
             $"从历史里删除这一条记录？\n\n{row.TimeText}　{row.OpText}　{row.PathText}\n\n" +
             "· 只删除这条「变化记录」，磁盘上的文件不会被改动。\n" +
-            "· 已存在的恢复点不受影响。\n" +
+            "· 已经保存的时间点不受影响。\n" +
             "· 删除后无法恢复这条记录本身。\n\n继续吗？",
             "删除这条历史记录",
             System.Windows.MessageBoxButton.OKCancel);
@@ -2606,7 +2633,7 @@ public sealed class MainViewModel : ObservableObject
             $"清空「{_selectedRoot.Path}」的全部变化记录？\n\n" +
             $"将删除 {Events.Count} 条已显示的变化记录。\n\n" +
             "· 只删除「变化记录」，磁盘上的文件不会被改动。\n" +
-            "· 已存在的恢复点不受影响，仍然可以恢复。\n" +
+            "· 已经保存的时间点不受影响，仍然可以恢复。\n" +
             "· 删除后无法撤销。\n\n继续吗？",
             "清空变化记录",
             System.Windows.MessageBoxButton.OKCancel);
@@ -2638,8 +2665,8 @@ public sealed class MainViewModel : ObservableObject
             "清空全部历史数据？\n\n" +
             "将要删除：\n" +
             "· 全部变化记录\n" +
-            "· 全部恢复点（清掉之后就再也回不到过去了）\n" +
-            "· 内容库里的所有历史内容（占空间的大头）\n" +
+            "· 全部时间点（清掉之后就再也回不到过去了）\n" +
+            "· 保存的历史文件内容（占空间的大头）\n" +
             "· 恢复记录与文件索引\n\n" +
             "保留：受保护文件夹的登记（不用重新选文件夹）。\n" +
             "磁盘上你的原始文件不会被改动。\n\n" +
@@ -2694,7 +2721,7 @@ public sealed class MainViewModel : ObservableObject
 
             System.Windows.MessageBox.Show(
                 $"已把存储位置设为：\n{target}\n\n" +
-                "· **下次启动程序时生效**（数据库和内容库已经打开，中途换位置不安全）。\n" +
+                "· **下次启动程序时生效**（历史数据已经打开，中途换位置不安全）。\n" +
                 "· 现在的历史数据不会自动搬过去；需要的话请手动把旧目录里的内容复制过去，或者先用「清空记录」清理。\n" +
                 "· 原来的位置会保留，确认新位置可用之后你可以自己删掉它。",
                 "存储位置已设置",
@@ -2768,11 +2795,11 @@ public sealed class MainViewModel : ObservableObject
     /// </summary>
     private void ClearAllData()
     {
-        var roots = _rt.Roots.ListAll().ToList();
+        var roots = _protection.ListRoots().ToList();
         var confirm = DangerBox.Show(
             "\u8fd9\u4f1a\u6e05\u7a7a\u300c\u56de\u6eaf\u300d\u8bb0\u5f55\u7684\u5168\u90e8\u6570\u636e\uff0c\u5e76\u79fb\u9664\u6240\u6709\u4fdd\u62a4\u6587\u4ef6\u5939\uff1a\n\n" +
             $"· 保护文件夹登记：{roots.Count} 个（会被移出保护范围）\n" +
-            "· 变化记录、恢复点、文件索引、恢复记录、内容库：全部删除\n\n" +
+            "· 变化记录、时间点、文件清单索引、恢复记录、保存的历史内容：全部删除\n\n" +
             "❗ 磁盘上的原始文件不会被删除或修改，只是以后不再记录它们的变化。\n" +
             "❗ 删除后无法撤销，历史将永久消失。\n\n" +
             $"数据目录：{_rt.DataDirectory}\n\n" +
@@ -2786,7 +2813,7 @@ public sealed class MainViewModel : ObservableObject
             // 先移除保护范围（连历史一起），再清剩余内容库
             foreach (var root in roots)
             {
-                try { _rt.Watch.RemoveRoot(root.Id, deleteHistory: true); }
+                try { _protection.RemoveRoot(root.Id, true); }
                 catch (Exception) { /* 单个失败不应挡住整体清理 */ }
             }
             var (ok, report) = _rt.Maintenance.PurgeAllHistory();
@@ -2886,51 +2913,11 @@ public sealed class MainViewModel : ObservableObject
     /// <summary>
     /// 把用户勾选的路径展开成"引擎能吃的精确路径集合"。
     ///
-    /// 为什么需要：勾选一个目录的语义是"恢复整个目录"，但引擎的
-    /// <c>CompareWithSnapshot(includePaths)</c> 是**精确匹配**
-    /// （<c>keep.Contains(c.RelativePath)</c>），不是前缀匹配。
-    /// 所以必须在这里把目录展开成"目录自身 + 它在这个时间点里的全部后代路径"。
-    ///
-    /// 展开依据是该时间点的清单本身 —— 也就是说"恢复到它当时的完整样子"，
-    /// 而不是猜。勾选文件时行为完全不变（原样返回）。
-    /// </summary>
-    private List<string> ExpandPickedPaths(long snapshotId, List<string> picked)
-    {
-        var entries = LoadManifestEntries(snapshotId);
-        if (entries is null || entries.Count == 0) return picked;
-
-        // 只看路径，不关心内容，所以用精确比较的集合开销更小
-        var isDirectory = new HashSet<string>(PathUtil.Comparer);
-        foreach (var e in entries)
-        {
-            if (e.Kind == EntryKind.Directory) isDirectory.Add(e.RelativePath);
-        }
-
-        var result = new List<string>(picked);
-        var seen = new HashSet<string>(picked, PathUtil.Comparer);
-
-        foreach (var path in picked)
-        {
-            if (!isDirectory.Contains(path)) continue;      // 是文件 → 原样保留
-            var prefix = path + "/";
-            foreach (var e in entries)
-            {
-                if (e.RelativePath.Length == 0) continue;
-                if (!e.RelativePath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
-                if (seen.Add(e.RelativePath)) result.Add(e.RelativePath);
-            }
-        }
-
-        return result;
-    }
-
     /// <summary>
     /// 面板上的「确认恢复」：把**恢复集合里的文件**合起来，一次性交给现有 Restore Engine。
     ///
-    /// 自定义恢复的关键就在这里：集合里的文件可能来自不同时间点，
-    /// 因此按"来源快照"分组、各生成一份只含这些路径的恢复计划，
-    /// 再把所有步骤**合并成一个计划**执行 —— 引擎只消费 plan.Steps 与 plan.Current，
-    /// 所以不需要改动恢复引擎本身的任何逻辑。
+    /// 计划怎么合（分组、目录展开、去重、删除并入、指纹）已下沉到 <see cref="RestoreCoordinator"/>；
+    /// 这里只负责确认文案、按钮状态与执行后的界面反应。
     /// </summary>
     private void ConfirmRestoreFromPanel()
     {
@@ -2943,68 +2930,20 @@ public sealed class MainViewModel : ObservableObject
 
         try
         {
-            // ① 要恢复的：按来源时间点分组
-            //    勾选目录时展开成整棵子树 —— 引擎的 includePaths 是**精确匹配**
-            //    （CompareWithSnapshot 里 keep.Contains(RelativePath)），
-            //    只传目录路径只会得到目录自身一条、不含里面的文件。
-            var groups = RestorePicked
+            // 分组、目录展开、去重、删除合并、指纹 —— 全部在恢复协调器里完成。
+            // 这里只做界面的事：确认文案怎么措辞、按钮状态、完成后显示什么。
+            var picks = RestorePicked
                 .Where(p => !p.IsDeletion)
-                .GroupBy(p => p.SnapshotId)
-                .Select(g => new { SnapshotId = g.Key, Paths = ExpandPickedPaths(g.Key, g.Select(p => p.RelativePath).ToList()) })
+                .Select(p => (SnapshotId: p.SnapshotId, RelativePath: p.RelativePath))
                 .ToList();
 
-            var merged = new RestorePlan { RootId = _selectedRoot.Id };
-            var seenPaths = new HashSet<string>(PathUtil.Comparer);
-            var dropped = 0;
-            var unavailable = 0;
-            DateTime? latestTarget = null;
+            var (merged, error, dropped, unavailable, latestTarget) =
+                _restoreFlow.BuildMergedPlan(_selectedRoot.Id, picks, _deletionPaths.ToList());
 
-            foreach (var g in groups)
+            if (merged is null)
             {
-                var snap = _rt.SnapshotsRepo.Get(g.SnapshotId);
-                if (snap is null) continue;
-
-                var (groupPlan, error) = _rt.Restore.BuildPreviewAt(_selectedRoot.Id, snap.TimestampUtc, g.Paths);
-                if (groupPlan is null)
-                {
-                    InfoBanner = error ?? "无法生成恢复计划。";
-                    return;
-                }
-
-                if (merged.Current.Entries.Count == 0)
-                {
-                    // 冲突检测基线取第一次预览时的当前状态；所有分组共用同一份快照
-                    merged.Current = groupPlan.Current;
-                }
-
-                foreach (var step in groupPlan.Steps)
-                {
-                    // 同一个路径被勾了两次（来自不同时间点）时，只保留第一次
-                    if (!seenPaths.Add(step.RelativePath)) { dropped++; continue; }
-                    merged.Steps.Add(step);
-                }
-
-                unavailable += groupPlan.UnavailableCount;
-                if (latestTarget is null || snap.TimestampLocal > latestTarget) latestTarget = snap.TimestampLocal;
-            }
-
-            // ② 要删除的：并入同一个计划。恢复与删除的目标路径不应重叠，重叠时以删除为准。
-            if (_deletionPaths.Count > 0)
-            {
-                var (delPlan, delError) = _rt.Restore.BuildDeletionPreview(_selectedRoot.Id, _deletionPaths.ToList());
-                if (delPlan is null)
-                {
-                    InfoBanner = delError ?? "无法生成删除计划。";
-                    return;
-                }
-                if (merged.Current.Entries.Count == 0) merged.Current = delPlan.Current;
-
-                foreach (var step in delPlan.Steps)
-                {
-                    if (!seenPaths.Add(step.RelativePath)) continue;   // 同一路径已按恢复处理
-                    merged.Steps.Add(step);
-                }
-                merged.Warnings.AddRange(delPlan.Warnings);
+                InfoBanner = error ?? "无法生成恢复计划。";
+                return;
             }
 
             if (dropped > 0)
@@ -3012,24 +2951,16 @@ public sealed class MainViewModel : ObservableObject
                 InfoBanner = $"有 {dropped} 个文件被重复勾选（同一个路径来自不同时间点），只按第一次选中的版本恢复。";
             }
 
-            if (!merged.HasEffect)
-            {
-                InfoBanner = "恢复集合里的内容与当前状态一致，没有需要执行的操作。";
-                return;
-            }
-
-            merged.ComputeFingerprint();
-
             // 确认框必须把"要找回的"和"要删掉的"当成两件事分别报数（真实缺陷）。
             //   原来的写法用一个 counts 概括，用户明明做的是"恢复 1 个 + 删除 1 个"，
             //   弹出来的却是"删除 2 个文件" —— 他没法确认自己即将做的事。
             //   这里用的是**计划本身**的计数（merged），也就是真正会执行的操作，
             //   而不是用户勾选的数量：两者在"重复勾选/来源时间点之后新增"时会不一致。
             var pickedRestore = RestorePicked.Count(p => !p.IsDeletion);
-            var byTime = RestorePicked
+            var picksByTime = RestorePicked
                 .Where(p => !p.IsDeletion)
                 .GroupBy(p => p.SnapshotLabel)
-                .Select(g => $"{g.Key}（{g.Count()} 个）")
+                .OrderBy(g => g.Key, StringComparer.Ordinal)
                 .ToList();
 
             var willRestoreFiles = merged.RestoreCount;
@@ -3043,7 +2974,27 @@ public sealed class MainViewModel : ObservableObject
             {
                 lines.Add($"将恢复 {willRestoreFiles} 个文件" +
                           (willRestoreDirs > 0 ? $"、{willRestoreDirs} 个文件夹" : string.Empty) + "：");
-                if (byTime.Count > 0) lines.AddRange(byTime.Select(t => "  · " + t));
+
+                // ── 必须列出**实际要恢复的文件**，而不是只给一个计数 ──
+                // 用户可能从不同时间点各勾了几项（跨时间点勾选是刻意允许的），
+                // 只写"10:41（2 个）"的话他无法确认最终到底动哪些文件。
+                // 每段最多列 6 个，其余用"还有 N 个"如实交代。
+                foreach (var group in picksByTime)
+                {
+                    var paths = group.Select(p => p.RelativePath).ToList();
+                    var shown = string.Join("、", paths.Take(6));
+                    var more = paths.Count > 6 ? $"，…还有 {paths.Count - 6} 个" : string.Empty;
+                    lines.Add($"  · {group.Key}：{shown}{more}");
+                }
+
+                // ── 口径说明：勾选数 ≠ 计划步数 ──
+                // 与目标状态本来就一致的那些勾选项不会产生任何动作，
+                // 不解释的话用户会看到"我勾了 3 个，怎么只说恢复 1 个"。
+                var plannedRestores = merged.RestoreCount + merged.CreateDirectoryCount;
+                if (pickedRestore > plannedRestores)
+                {
+                    lines.Add($"  （另外 {pickedRestore - plannedRestores} 项与目标状态一致，无需改动）");
+                }
             }
             if (willRemoveFiles > 0 || willRemoveDirs > 0)
             {
@@ -3080,8 +3031,7 @@ public sealed class MainViewModel : ObservableObject
                     ? "自定义恢复"
                     : "自定义恢复（" + latestTarget.Value.ToString("M月d日 HH:mm", CultureInfo.InvariantCulture) + " 等）";
 
-            RunRestore(() => _rt.Restore.Execute(plan, fingerprint, allowNewRemovals: true,
-                log: null), savedLabel);
+            RunRestore(() => _restoreFlow.Execute(plan, fingerprint), savedLabel);
         }
         catch (Exception ex)
         {

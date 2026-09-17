@@ -114,18 +114,29 @@ public sealed class RestorePlanner
                     break;
 
                 case ChangeKind.TypeChanged:
-                    // 类型变化：先移除现有实体，再按目标类型重建
-                    if (change.KindAfter == EntryKind.Directory)
+                    // 类型变化：**目标类型**决定最终形态，先移除旧形态、再建立新形态。
+                    //
+                    // ⚠ 真实缺陷（本轮修复，双向测试暴露）：这里原先判的是 change.KindAfter，
+                    //   而 After 属于"当前状态"那一侧（见下方 AddRestore 的字段方向说明），
+                    //   于是两个方向都反了：
+                    //     目标=文件、当前=目录 → 走进"移除同名文件，改为目录"（目标被当成目录）；
+                    //     目标=目录、当前=文件 → 走进"移除同名目录，改为文件"（目标被当成文件）。
+                    //   判据必须取目标侧 KindBefore。
+                    if (change.KindBefore == EntryKind.Directory)
                     {
+                        // 目标=目录、当前=文件：先按"文件"移除当前这个文件，再建目录
                         plan.Steps.Add(RemoveStep(change, "移除同名文件，改为目录", options,
+                            kindOverride: EntryKind.File,
                             expectedCurrentHash: current.Find(change.RelativePath)?.Hash));
                         plan.Steps.Add(DirectoryStep(change, options));
                     }
                     else
                     {
+                        // 目标=文件、当前=目录：先按"目录"移除旧目录（它下面该删的子项由各自的步骤负责），
+                        // 再写回文件内容。目录没有内容哈希，不做哈希冲突检测。
                         plan.Steps.Add(RemoveStep(change, "移除同名目录，改为文件", options,
                             kindOverride: EntryKind.Directory,
-                            expectedCurrentHash: current.Find(change.RelativePath)?.Hash));
+                            expectedCurrentHash: null));
                         AddRestore(plan, change, current, options);
                     }
                     break;
@@ -251,13 +262,17 @@ public sealed class RestorePlanner
         string? targetHash = change.HashBefore ?? change.HashAfter;
         long? objectId = change.ObjectIdBefore ?? change.ObjectIdAfter;
 
+        // 步骤的 Kind 也必须取**目标侧**：类型变化时 KindAfter 是"当前"的类型，
+        // 用它会让"恢复成文件"的步骤自称是目录步骤。
+        var targetStepKind = change.KindBefore ?? change.KindAfter ?? EntryKind.File;
+
         if (targetHash is null)
         {
             plan.Steps.Add(new RestoreStep
             {
                 Action = RestoreAction.NoChange,
                 RelativePath = change.RelativePath,
-                Kind = change.KindAfter ?? change.KindBefore ?? EntryKind.File,
+                Kind = targetStepKind,
                 ContentAvailable = false,
                 SourceChange = change.Kind,
                 RootId = change.RootId,
@@ -275,7 +290,7 @@ public sealed class RestorePlanner
         {
             Action = RestoreAction.RestoreContent,
             RelativePath = change.RelativePath,
-            Kind = change.KindAfter ?? change.KindBefore ?? EntryKind.File,
+            Kind = targetStepKind,
             TargetHash = targetHash,
             TargetObjectId = objectId,
             TargetSize = change.SizeBefore ?? change.SizeAfter,

@@ -1,8 +1,15 @@
 {
   "protocol": "timeback-agent",
   "version": "1.0",
-  "status": "reserved",
+  "status": "experimental",
   "documentation": "docs/agent-protocol.md",
+
+  "implementation": {
+    "form": "cli",
+    "entry": "LastRegret.Agent.exe",
+    "usage": "LastRegret.Agent.exe <command> [<request.json>]",
+    "note": "最小可用实现：一次进程一次调用，JSON 进 JSON 出；stdout 恰好一个 JSON 对象，诊断走 stderr。restore 必须带 preview 返回的 fingerprint，与 GUI 使用同一套恢复安全机制。"
+  },
 
   "product": {
     "id": "timeback",

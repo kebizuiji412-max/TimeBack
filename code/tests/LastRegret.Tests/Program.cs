@@ -36,6 +36,11 @@ public static class Program
         cases.AddRange(TimezoneSuites.All());
         cases.AddRange(PrelaunchSuites.All());
         cases.AddRange(PrelaunchSuites2.All());
+        cases.AddRange(ApplicationSuites.All());
+        cases.AddRange(SnapshotRegressionSuites.All());
+        cases.AddRange(WatchSplitSuites.All());
+        cases.AddRange(AgentCliSuites.All());
+        cases.AddRange(ReliabilitySuites.All());
 
 
         if (!string.IsNullOrWhiteSpace(filter))
