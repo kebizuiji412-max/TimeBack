@@ -9,7 +9,7 @@
     <InvariantGlobalization>false</InvariantGlobalization>
     <SatelliteResourceLanguages>zh-Hans;en</SatelliteResourceLanguages>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Product>最后悔的 Ctrl+Z</Product>
     <Company>TimeBack</Company>
     <Copyright>本地文件时间机器 MVP</Copyright>

@@ -47,7 +47,7 @@ MCP / 任何第三方 Agent SDK）。协议必须由 TimeBack 自己定义。
 | 协议版本 | **1.0** |
 | 协议状态 | `experimental`（协议 1.0 保持不变；已有最小 CLI 实现，见第 13 节） |
 | 产品 | 回溯 / TimeBack |
-| 产品版本 | **0.1.0**（见 `code/Directory.Build.props`） |
+| 产品版本 | **0.2.0**（见 `code/Directory.Build.props`） |
 | 平台 | Windows |
 
 协议版本与产品版本**各自独立演进**。产品发 1.0 不代表协议变成 1.0-x，反之亦然。

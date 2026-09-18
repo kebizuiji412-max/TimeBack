@@ -101,7 +101,7 @@ public sealed class LastRegretDatabase : IDisposable
             SetMeta(Events, "schema_version", Schema.CurrentVersion.ToString());
             SetMeta(Objects, "schema_version", Schema.CurrentVersion.ToString());
             SetMeta(Events, "created_utc", DateTime.UtcNow.Ticks.ToString());
-            SetMeta(Events, "app_version", "0.1.0");
+            SetMeta(Events, "app_version", "0.2.0");
             health.SchemaVersion = Schema.CurrentVersion;
         }
         else if (version < Schema.CurrentVersion)

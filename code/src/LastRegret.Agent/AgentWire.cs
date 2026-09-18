@@ -128,7 +128,7 @@ internal sealed class CapabilityInfo
 internal sealed class CapabilitiesData
 {
     public string Product { get; set; } = "timeback";
-    public string ProductVersion { get; set; } = "0.1.0";
+    public string ProductVersion { get; set; } = "0.2.0";
     public List<CapabilityInfo> Capabilities { get; set; } = new();
 }
 
