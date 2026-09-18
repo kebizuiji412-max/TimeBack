@@ -3,7 +3,6 @@
 **中文** | [English](README.en.md)
 
 > **产品名**：回溯（英文名 TimeBack）
-> **目录名**：`project-019-zuihouhui-de-ctrlz`（拼音——中文路径 + 特殊字符会让部分构建工具在参数解析/编码转换时出错，代价远大于收益）
 > **一句话定位**：把「只能在当前软件里撤销」的 Ctrl+Z，扩展成「针对本机文件状态与操作历史的时间旅行恢复」。
 > **项目原则**：记录事实，不伪造因果。可恢复就明确写可恢复；不能保证恢复就明确写限制。
 
@@ -93,7 +92,7 @@
 ### 目录结构
 
 ```
-project-019-zuihouhui-de-ctrlz/
+TimeBack/
 ├── README.md                 # 本文件
 ├── README.en.md              # English version
 ├── docs/                     # 设计与协议文档

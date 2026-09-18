@@ -1,15 +1,11 @@
-﻿<#
+<#
     build.ps1 - offline build script for "LastRegret" (project-019)
-    Project folder: projects\project-019-zuihouhui-de-ctrlz
+    Repository: TimeBack  (clone into whatever directory name you like)
     -----------------------------------------------------------------
     NOTE 1 - this file is intentionally PURE ASCII (English comments and
       messages). Windows PowerShell 5.1 reads a .ps1 without a UTF-8 BOM
       as ANSI/GBK, which turns Chinese text into mojibake and breaks the
       parser. Keeping the script ASCII removes that whole class of error.
-
-    NOTE 2 - the project folder uses pinyin (zuihouhui-de-ctrlz) instead
-      of Chinese, because Chinese paths plus special characters break
-      argument parsing / encoding conversion in some build tools.
 
     Machine constraints (measured 2026-09-11):
       1. No system-wide .NET SDK. Only a portable SDK 8.0.424 that ships

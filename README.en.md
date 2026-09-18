@@ -81,7 +81,7 @@ The timestamp only chooses which historical state you browse. **What actually ge
 ### Directory layout
 
 ```
-project-019-zuihouhui-de-ctrlz/
+TimeBack/
 ├── README.md                 # Chinese version
 ├── README.en.md              # this file
 ├── docs/                     # design and protocol documents
