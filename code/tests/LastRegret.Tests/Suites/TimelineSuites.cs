@@ -41,22 +41,139 @@ public static class TimelineSuites
             box.WriteFile("config.json", "{ \"port\": 8080 }");
             box.WaitForEvent("config.json", OperationType.Created);
 
-            // 等"创建"先成为独立事实（600ms：整套测试满载时合并窗口会变慢，
-            // 250ms 会让后面这次修改并进"创建"里，测试就会偶发失败）
-            Thread.Sleep(600);
+            // 等两件"事实"真正出现，而不是靠时间：
+            //   ① Flush 把这次创建作为**独立事件**落库（否则第二次修改会被并进创建里）；
+            //   ② 索引已经追上磁盘 —— 这一步是必需的：管线是"先落事件、后更新索引"
+            //      （见 WatchEventPipeline.Persist），而 WaitForEvent 只查事件表，
+            //      所以它返回时索引可能还停留在上一版。合并器捕获"变化前内容"时
+            //      读的正是索引（EventMerger.CaptureFromIndex），索引没追上就拿不到旧内容。
+            //      产品在这种情形下是安全的（宁可晚一点记录，也绝不错记内容），
+            //      这里只是让测试具备确定性。超时仍然 FAIL。
+            box.WaitForIndex("config.json");
             box.WriteFile("config.json", "{ \"port\": 9090 }");
-            var ev = box.WaitForEvent("config.json", OperationType.Modified);
 
-            Check.NotNull(ev.HashBefore, "应记录变化前哈希");
-            Check.NotNull(ev.HashAfter, "应记录变化后哈希");
-            Check.NotEqual(ev.HashBefore, ev.HashAfter, "内容确实变了");
-            Check.True(ev.CanRestorePrevious, "必须能恢复到修改之前（这是产品的核心承诺）");
-            Check.NotNull(ev.ObjectIdBefore, "变化前内容必须已存入 CAS");
+            // 仅失败时输出完整事实链。绝不吞掉失败：dump 之后照原样抛出去。
+            void DumpFlakyFacts(FileEvent? failedEvent)
+            {
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine("=== 修改文件 flaky 诊断（仅失败时输出）===");
 
-            // 变化前内容确实能取出来
-            Check.True(box.Store.TryReadAllBytes(ev.ObjectIdBefore!.Value, 4096, out var bytes, out var err),
-                "应能读出变化前的内容：" + err);
-            Check.Equal("{ \"port\": 8080 }", Encoding.UTF8.GetString(bytes), "变化前内容必须与最初写入的一致");
+                sb.AppendLine("-- 1. 磁盘事实 --");
+                var diskPath = box.Abs("config.json");
+                if (File.Exists(diskPath))
+                {
+                    var diskBytes = File.ReadAllBytes(diskPath);
+                    var diskSha = Convert.ToHexString(
+                        System.Security.Cryptography.SHA256.HashData(diskBytes)).ToLowerInvariant();
+                    var fi = new FileInfo(diskPath);
+                    sb.AppendLine($"  path={diskPath} size={fi.Length} sha256={diskSha} " +
+                                  $"mtimeUtc={fi.LastWriteTimeUtc:o} content=[{Encoding.UTF8.GetString(diskBytes)}]");
+                }
+                else
+                {
+                    sb.AppendLine("  （文件不存在）");
+                }
+
+                sb.AppendLine("-- 2. FileIndex --");
+                var ie = box.Index.Get(box.RootId, "config.json");
+                sb.AppendLine(ie is null
+                    ? "  （索引里没有该路径）"
+                    : $"  path={ie.RelativePath} hash={ie.Hash ?? "-"} size={ie.Size} " +
+                      $"objectId={ie.ObjectId?.ToString() ?? "-"} lastEventId={ie.LastEventId?.ToString() ?? "-"} " +
+                      $"isDeleted={ie.IsDeleted}");
+
+                sb.AppendLine("-- 3. 事件（id ASC）--");
+                var evs = box.Events
+                    .Query(new LastRegret.Core.Abstractions.EventQuery { RootId = box.RootId, Limit = 500, Descending = false })
+                    .Where(e => e.RelativePath == "config.json")
+                    .ToList();
+                foreach (var e in evs)
+                {
+                    sb.AppendLine($"  id={e.Id} op={e.Operation} hashBefore={e.HashBefore ?? "-"} " +
+                                  $"hashAfter={e.HashAfter ?? "-"} sizeBefore={e.SizeBefore?.ToString() ?? "-"} " +
+                                  $"sizeAfter={e.SizeAfter?.ToString() ?? "-"} objBefore={e.ObjectIdBefore?.ToString() ?? "-"} " +
+                                  $"objAfter={e.ObjectIdAfter?.ToString() ?? "-"} ts={e.TimestampUtc:o} source={e.Source} " +
+                                  $"merge={e.MergeCount} coalesced={e.IsCoalesced} transient={e.IsTransient} note={e.Note ?? "-"}");
+                }
+                if (evs.Count == 0) sb.AppendLine("  （无事件）");
+
+                sb.AppendLine("-- 4. FileVersion + CAS --");
+                var vers = box.Versions.ListForPath(box.RootId, "config.json", 50);
+                foreach (var v in vers)
+                {
+                    var casExists = v.ObjectId.HasValue ? box.Store.Exists(v.ObjectId.Value).ToString() : "-";
+                    sb.AppendLine($"  hash={v.Hash} objectId={v.ObjectId?.ToString() ?? "-"} size={v.Size} " +
+                                  $"recorded={v.RecordedUtc:o} eventId={v.EventId?.ToString() ?? "-"} " +
+                                  $"snapshotId={v.SnapshotId?.ToString() ?? "-"} pruned={v.ContentPruned} " +
+                                  $"casExists={casExists} note={v.Note ?? "-"}");
+                }
+                if (vers.Count == 0) sb.AppendLine("  （无版本）");
+
+                sb.AppendLine("-- 5. 流水线状态 --");
+                sb.AppendLine(box.DescribeWatcher());
+                sb.AppendLine("  PendingSnapshotEvents=" + box.Watch.PendingSnapshotEvents(box.RootId));
+
+                sb.AppendLine("-- 断言用到的那个事件 --");
+                sb.AppendLine(failedEvent is null
+                    ? "  （没有取到 Modified 事件）"
+                    : $"  id={failedEvent.Id} hashBefore={failedEvent.HashBefore ?? "-"} " +
+                      $"objBefore={failedEvent.ObjectIdBefore?.ToString() ?? "-"} " +
+                      $"canRestorePrevious={failedEvent.CanRestorePrevious}");
+
+                Console.WriteLine(sb.ToString());
+            }
+
+            FileEvent? ev = null;
+            try
+            {
+                // 等一条"内容确实变了"的修改事件 —— 不能只等"出现 Modified"：
+                // 一次 WriteAllText 会产生多个通知，第一次写入自身就可能带出一条
+                // 「内容哈希未变化（写回原内容）」的 Modified 事件（实测在 0.84ms 后落库），
+                // 抢到它就会拿两个相同的哈希去做"内容确实变了"的断言。
+                // 条件等待：事实出现才算通过，超时仍然 FAIL。
+                Check.True(box.WaitFor(() =>
+                {
+                    box.Flush();
+                    // 一次写入会产生 2~3 条「修改」事件：一条内容确实变了，一条是"写回原内容"
+                    // （note 里写着内容哈希未变化），而它们的先后顺序依时序而变
+                    // （有时第一条还会带上"已合并 1 次重复通知"）。
+                    // 所以必须遍历候选，找**内容确实变了**的那条 —— 只看最新一条会拿错。
+                    var candidates = box.Events.Query(new LastRegret.Core.Abstractions.EventQuery
+                    {
+                        RootId = box.RootId,
+                        RelativePath = "config.json",
+                        Operations = new[] { OperationType.Modified },
+                        IncludeTransient = true,
+                        Limit = 10,
+                        Descending = true,
+                    }).ToList();
+                    foreach (var c in candidates)
+                    {
+                        if (string.IsNullOrEmpty(c.HashBefore) || string.IsNullOrEmpty(c.HashAfter)) continue;
+                        if (string.Equals(c.HashBefore, c.HashAfter, StringComparison.OrdinalIgnoreCase)) continue;
+                        ev = c;
+                        return true;
+                    }
+                    return false;
+                }, 20000, "内容确实发生变化的「修改」事件"), "应当出现一条记录了内容变化的修改事件");
+
+                var hit = ev!;
+                Check.NotNull(hit.HashBefore, "应记录变化前哈希");
+                Check.NotNull(hit.HashAfter, "应记录变化后哈希");
+                Check.NotEqual(hit.HashBefore, hit.HashAfter, "内容确实变了");
+                Check.True(hit.CanRestorePrevious, "必须能恢复到修改之前（这是产品的核心承诺）");
+                Check.NotNull(hit.ObjectIdBefore, "变化前内容必须已存入 CAS");
+
+                // 变化前内容确实能取出来
+                Check.True(box.Store.TryReadAllBytes(hit.ObjectIdBefore!.Value, 4096, out var bytes, out var err),
+                    "应能读出变化前的内容：" + err);
+                Check.Equal("{ \"port\": 8080 }", Encoding.UTF8.GetString(bytes), "变化前内容必须与最初写入的一致");
+            }
+            catch (Exception ex)
+            {
+                DumpFlakyFacts(ev);
+                throw new Exception("修改文件未能留下旧版内容：" + ex.Message, ex);
+            }
         });
 
         yield return new("监听与事件·真实文件系统", "删除文件 → 删除前内容仍可恢复", () =>

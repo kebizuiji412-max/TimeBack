@@ -101,14 +101,20 @@ public static class WatchSplitSuites
             box.WaitForEvent("a.txt", OperationType.Created);
             box.Flush();
 
+            // 让磁盘真的漂移（监听漏掉这次写入），场景才与下面"必须留下 Resync 快照"自洽。
+            // 「磁盘没变就不该制造恢复点」由 收口·重扫垃圾点 那组测试覆盖。
+            box.Watch.Pause(box.RootId);
+            File.WriteAllText(box.Abs("a.txt"), "第二版（监听漏掉）");
+
             var rescansBefore = box.Watch.Statistics.RescanCount;
             box.Watch.RequestRescan(box.RootId, "拆分回归测试");
 
             Check.True(box.WaitFor(
                     () => box.SnapshotsRepo.List(box.RootId).Any(s => s.Kind == SnapshotKind.Resync),
                     20000, "重新对齐应留下 Resync 快照"),
-                "重新对齐之后必须建立 Resync 快照（否则时间线与快照链会错位）");
+                "有漂移的重新对齐之后必须建立 Resync 快照（否则时间线与快照链会错位）");
             Check.True(box.Watch.Statistics.RescanCount > rescansBefore, "重新对齐次数应计入统计");
+            box.Watch.Resume(box.RootId, rescan: false);
         });
 
         // ── ① 多 root 隔离 ───────────────────────────────────────────────

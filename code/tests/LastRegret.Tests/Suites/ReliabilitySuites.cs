@@ -217,6 +217,105 @@ public static class ReliabilitySuites
     {
         // ═══════════════ P1-4：非干净退出 → 启动自动对账 ═══════════════
 
+        // ═══════════════ 收口·重扫垃圾点 ═══════════════
+        // 真实缺陷：ProcessPendingRescans 原先**无条件**创建 SnapshotKind.Resync 点，
+        // 于是"脏退出启动但磁盘其实没变"也会留下一个恢复点。实测累积到 41 个，
+        // 把用户真正要找的历史时间点挤到列表很后面。
+        // 判据：只修"没有变化也创建快照"，不动 Resync 类型本身，也不清理历史点。
+
+        yield return new("收口·重扫垃圾点", "无漂移的重新对齐不得创建恢复点", () =>
+        {
+            using var box = Sandbox.Create("rel-resync-nodrift");
+            box.WriteFile("seed.txt", "seed");
+            box.Protect();
+            box.WaitForIndex("seed.txt");
+            box.Flush();
+
+            var beforeCount = box.SnapshotsRepo.List(box.RootId, 500, null, null).Count;
+            var beforeRescans = box.Watch.Statistics.RescanCount;
+
+            box.Watch.RequestRescan(box.RootId, "测试：无漂移");
+            // RequestRescan 只把请求入队、不置位任何标志，所以"等 Scanning/NeedsRescan"
+            // 会在请求还没被处理时立刻返回（假通过）。用引擎自己的 rescan 计数器证明它真的跑完。
+            Check.True(box.WaitFor(
+                () => box.Watch.Statistics.RescanCount > beforeRescans,
+                20000, "重新对齐执行"), "重新对齐必须真的执行完");
+            Check.True(box.WaitFor(() =>
+            {
+                var st = box.Watch.GetStates().First(s => s.RootId == box.RootId);
+                return !st.Scanning && !st.NeedsRescan;
+            }, 20000, "重新对齐完成"), "重新对齐应在超时前完成");
+
+            Thread.Sleep(500);   // 若真建了快照，给落库留出时间
+            var after = box.SnapshotsRepo.List(box.RootId, 500, null, null);
+            Check.Equal(beforeCount, after.Count,
+                "磁盘与记录一致时不得新增任何恢复点（原实现无条件建 Resync 点）");
+            Check.Equal(0, after.Count(s => s.Kind == SnapshotKind.Resync), "更不该新增 Resync 点");
+        });
+
+        yield return new("收口·重扫垃圾点", "连续三次无漂移重新对齐：恢复点总数必须一个都不加", () =>
+        {
+            using var box = Sandbox.Create("rel-resync-nodrift3");
+            box.WriteFile("seed.txt", "seed");
+            box.Protect();
+            box.WaitForIndex("seed.txt");
+            box.Flush();
+
+            var beforeCount = box.SnapshotsRepo.List(box.RootId, 500, null, null).Count;
+            for (var i = 0; i < 3; i++)
+            {
+                var mark = box.Watch.Statistics.RescanCount;
+                box.Watch.RequestRescan(box.RootId, "测试：无漂移 " + i);
+                Check.True(box.WaitFor(
+                    () => box.Watch.Statistics.RescanCount > mark,
+                    20000, "第 " + i + " 次重新对齐执行"), "第 " + i + " 次重新对齐必须真的执行完");
+                var done = box.WaitFor(() =>
+                {
+                    var st = box.Watch.GetStates().First(s => s.RootId == box.RootId);
+                    return !st.Scanning && !st.NeedsRescan;
+                }, 20000, "第 " + i + " 次重新对齐完成");
+                Check.True(done, "第 " + i + " 次重新对齐应在超时前完成");
+            }
+
+            Thread.Sleep(500);
+            var afterCount = box.SnapshotsRepo.List(box.RootId, 500, null, null).Count;
+            Check.Equal(beforeCount, afterCount, "三次无漂移重新对齐之后恢复点数必须完全不变");
+        });
+
+        yield return new("收口·重扫垃圾点", "有漂移的重新对齐：恰好新增 1 个 Resync 点，清单等于修正后的磁盘", () =>
+        {
+            using var box = Sandbox.Create("rel-resync-drift");
+            box.WriteFile("seed.txt", "seed");
+            box.Protect();
+            box.WaitForIndex("seed.txt");
+            box.Flush();
+
+            var beforeCount = box.SnapshotsRepo.List(box.RootId, 500, null, null).Count;
+
+            // 让监听漏掉这次修改 —— 这正是"进程死亡期间的磁盘变化"的等价情形
+            box.Watch.Pause(box.RootId);
+            File.WriteAllText(box.Abs("seed.txt"), "changed-while-dead");
+            box.Watch.RequestRescan(box.RootId, "测试：有漂移");
+
+            // 暂停状态下标志位一开始就满足，等标志位会立刻返回（假通过）。
+            // 直接等结果：出现新的状态点。
+            Check.True(box.WaitFor(
+                () => box.SnapshotsRepo.List(box.RootId, 500, null, null).Count > beforeCount,
+                20000, "有漂移的重新对齐产生新的状态点"), "有漂移的重新对齐必须产生新的状态点");
+            Check.True(box.WaitFor(() =>
+            {
+                var st = box.Watch.GetStates().First(s => s.RootId == box.RootId);
+                return !st.Scanning;
+            }, 20000, "扫描结束"), "扫描应当结束");
+            box.Watch.Resume(box.RootId, rescan: false);
+
+            var after = box.SnapshotsRepo.List(box.RootId, 500, null, null);
+            Check.Equal(beforeCount + 1, after.Count, "有真实漂移时必须新增恰好 1 个恢复点");
+            var newest = after[0];
+            Check.Equal(SnapshotKind.Resync, newest.Kind, "新增的必须是 Resync（重新对齐）点");
+            AssertManifestMatchesDisk(box, newest, "重新对齐后的清单必须等于修正后的磁盘状态");
+        });
+
         yield return new("收口·脏退出", "干净退出后再次启动：不得自动补扫；脏退出则必须自动补扫并把 index 追平磁盘", () =>
         {
             var stamp = Guid.NewGuid().ToString("N")[..10];
@@ -979,9 +1078,11 @@ public static class ReliabilitySuites
             // 两个时间点下拉（时间点 / 目标时间点）都要用它，且不得再只绑时间
             Check.False(window.Contains("{Binding FriendlyTime}"),
                 "时间点下拉不得再只显示时间 —— 同一分钟里的两个时间点会无法区分");
-            var identified = window.Split("{Binding IdentifiedTime}").Length - 1;
+            // 用前缀统计，避免漏掉 ", Mode=OneWay}" 这种显式模式写法
+            // （上一版断言卡在字面 "{Binding IdentifiedTime}" 上，加了 Mode 之后就统计不到了）
+            var identified = window.Split("{Binding IdentifiedTime").Length - 1;
             Check.True(identified >= 2, "两个下拉都要显示身份（实际出现 " + identified + " 次）");
-            var ids = window.Split("{Binding IdSuffix}").Length - 1;
+            var ids = window.Split("{Binding IdSuffix").Length - 1;
             Check.True(ids >= 2, "两个下拉都要有编号兜底（实际出现 " + ids + " 次）");
 
             // 工具栏末端的确认文本、恢复集合的来源标签同样不能退化
@@ -989,6 +1090,40 @@ public static class ReliabilitySuites
                 "下拉旁边的确认文本必须带身份");
             Check.Contains(vm, "SnapshotLabel = snapRow.IdentifiedTime",
                 "恢复集合的来源标签必须带身份");
+        });
+
+        yield return new("收口·界面反馈", "身份展示绑定必须显式 OneWay（默认模式会让 MainWindow 启动即崩）", () =>
+        {
+            var appDir = Path.Combine(RepoRootForTests(), "src", "LastRegret.App");
+            var window = File.ReadAllText(Path.Combine(appDir, "MainWindow.xaml"));
+
+            // 真实崩溃记录：ComboBox 还没选中任何项时，ItemTemplate 仍会以 null DataContext
+            // （即 MS.Internal.NamedObject）求值一次。此时绑定若走默认模式做写回，
+            // WPF 会抛「无法对只读属性进行 TwoWay 绑定」，MainWindow 直接创建失败 ——
+            // 界面根本起不来。所以只读身份展示绑定必须一条不漏地显式 OneWay。
+            // （只断言"源码里有 IdentifiedTime"是不够的，它挡不住这次启动崩溃。）
+            var exprs = System.Text.RegularExpressions.Regex.Matches(window, @"\{Binding\s+[^}]*\}");
+            Check.True(exprs.Count > 0, "应当能从 MainWindow.xaml 里解析出绑定表达式");
+
+            var identityNames = new[] { "IdentifiedTime", "IdSuffix", "IdentityLabel" };
+            var offenders = new List<string>();
+            foreach (System.Text.RegularExpressions.Match m in exprs)
+            {
+                var text = m.Value;
+                if (!identityNames.Any(n => text.Contains(n, StringComparison.Ordinal))) continue;
+                if (!text.Contains("Mode=OneWay", StringComparison.Ordinal)) offenders.Add(text);
+            }
+
+            Check.Equal(0, offenders.Count,
+                "身份展示绑定必须显式 Mode=OneWay，缺失的：" + string.Join(" | ", offenders));
+
+            // 两个时间点下拉的无障碍名称必须反映当前选中的身份，而不只是时间
+            Check.Contains(window,
+                "AutomationProperties.Name=\"{Binding SelectedTimePointChoice.IdentifiedTime, Mode=OneWay}\"",
+                "「时间点」下拉的无障碍名称必须绑定完整身份且为 OneWay");
+            Check.Contains(window,
+                "AutomationProperties.Name=\"{Binding SelectedTargetPoint.IdentifiedTime, Mode=OneWay}\"",
+                "「目标时间点」下拉的无障碍名称必须绑定完整身份且为 OneWay");
         });
 
         // ═══════════════ F-02：句柄归属探测的资源失控 ═══════════════

@@ -575,14 +575,28 @@ public sealed class WatchService : IDisposable
                         $"重新对齐完成：新增 {report.DetectedCreated}、修改 {report.DetectedModified}、消失 {report.DetectedDeleted}" +
                         (report.DeletedWithoutContent > 0 ? $"（其中 {report.DeletedWithoutContent} 个删除无可恢复内容）" : string.Empty),
                         rootId);
+
+                    // 只有真的对上了磁盘差异，才需要新的状态点。
+                    // 时间线与快照链的锚点是"磁盘状态发生过变化"；没有变化也建恢复点，
+                    // 只会在用户的时间点列表里堆出一串认不出用途的垃圾点
+                    // （实测：每次脏退出启动都 +1，累积到 41 个，把真实历史挤走）。
+                    _snapshots.Create(rootId, SnapshotKind.Resync,
+                        $"重新对齐后建立的状态点（{reason}）");
+
+                    // "未进快照的事件数"只在**确实建立了快照**之后才清零。
+                    // 这个计数是自动快照的触发依据（见 MaybeAutoSnapshot）：
+                    // 没有新快照却清零，等于把累计凭空丢掉，只会让自动快照来得更晚。
+                    ResetEventCount(rootId);
+                    TimelineChanged?.Invoke();
+                }
+                else
+                {
+                    // 检查过而且一致 —— 这是结论，如实记进日志，但不污染用户的恢复时间线。
+                    Log("info", "重新对齐完成：磁盘与记录一致，未发现需要修正的变化。", rootId);
                 }
 
-                // 重新对齐之后必须刷新快照，否则"时间线"与"快照链"会错位
-                _snapshots.Create(rootId, SnapshotKind.Resync,
-                    $"重新对齐后建立的状态点（{reason}）");
-                ResetEventCount(rootId);
+                // 无论有没有漂移，这次对齐都已经完成；否则会被反复重扫。
                 state.NeedsRescan = false;
-                TimelineChanged?.Invoke();
             }
             catch (Exception ex)
             {

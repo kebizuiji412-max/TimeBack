@@ -372,12 +372,13 @@
                                        Margin="0,0,3,0" />
                             <ComboBox Width="210" Style="{StaticResource ToolCombo}" ItemsSource="{Binding TargetPointChoices}"
                                       SelectedItem="{Binding SelectedTargetPoint, Mode=TwoWay}"
+                                      AutomationProperties.Name="{Binding SelectedTargetPoint.IdentifiedTime, Mode=OneWay}"
                                       ToolTip="恢复到另一个时间点；点右边「当前状态」回到现在">
                                 <ComboBox.ItemTemplate>
                                     <!-- 时间 + 身份（备注或来源），末尾弱化编号兜底：
                                          只显示"9月15日 02:27"的话，同一分钟里的两个时间点没法分辨 -->
                                     <DataTemplate>
-                                        <TextBlock FontSize="11.5" ToolTip="{Binding IdentifiedTime}"><Run Text="{Binding IdentifiedTime}" /><Run Text="{Binding IdSuffix}" Foreground="{StaticResource FgDisable}" /></TextBlock>
+                                        <TextBlock FontSize="11.5" ToolTip="{Binding IdentifiedTime, Mode=OneWay}"><Run Text="{Binding IdentifiedTime, Mode=OneWay}" /><Run Text="{Binding IdSuffix, Mode=OneWay}" Foreground="{StaticResource FgDisable}" /></TextBlock>
                                     </DataTemplate>
                                 </ComboBox.ItemTemplate>
                             </ComboBox>
@@ -391,11 +392,12 @@
                             <TextBlock Text="时间点" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,3,0" />
                             <ComboBox Width="210" Style="{StaticResource ToolCombo}" ItemsSource="{Binding TimePointChoices}"
                                       SelectedItem="{Binding SelectedTimePointChoice, Mode=TwoWay}"
+                                      AutomationProperties.Name="{Binding SelectedTimePointChoice.IdentifiedTime, Mode=OneWay}"
                                       ToolTip="选一个要回到的时间点">
                                 <ComboBox.ItemTemplate>
                                     <!-- 同上：时间 + 身份，编号弱化显示 -->
                                     <DataTemplate>
-                                        <TextBlock FontSize="11.5" ToolTip="{Binding IdentifiedTime}"><Run Text="{Binding IdentifiedTime}" /><Run Text="{Binding IdSuffix}" Foreground="{StaticResource FgDisable}" /></TextBlock>
+                                        <TextBlock FontSize="11.5" ToolTip="{Binding IdentifiedTime, Mode=OneWay}"><Run Text="{Binding IdentifiedTime, Mode=OneWay}" /><Run Text="{Binding IdSuffix, Mode=OneWay}" Foreground="{StaticResource FgDisable}" /></TextBlock>
                                     </DataTemplate>
                                 </ComboBox.ItemTemplate>
                             </ComboBox>

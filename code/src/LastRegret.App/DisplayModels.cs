@@ -333,6 +333,13 @@ public sealed class PointRow : ObservableObject
     public string IdSuffix => " · #" + Point.SnapshotId.ToString(CultureInfo.InvariantCulture);
 
     /// <summary>
+    /// 下拉项的无障碍名称取自内容对象的 ToString —— WPF 不会为复杂 DataTemplate
+    /// 自动拼出文本名，不重写的话屏幕阅读器与自动化读到的是 "LastRegret.App.PointRow"。
+    /// 这里给出与视觉文本一致的完整身份（时间 · 身份 · #编号）。
+    /// </summary>
+    public override string ToString() => IdentifiedTime + IdSuffix;
+
+    /// <summary>
     /// 这个时间点是什么：用户自己留的 / 保护开始时 / 恢复前自动留的。
     /// 不向普通用户暴露"手动恢复点 / 基线 / 安全点"这类内部叫法。
     /// </summary>
