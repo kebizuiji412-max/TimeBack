@@ -1,5 +1,5 @@
 <#
-    build.ps1 - offline build script for "LastRegret" (project-019)
+    build.ps1 - offline build script for "LastRegret" / TimeBack
     Repository: TimeBack  (clone into whatever directory name you like)
     -----------------------------------------------------------------
     NOTE 1 - this file is intentionally PURE ASCII (English comments and
