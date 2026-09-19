@@ -61,7 +61,20 @@ internal static class Win32
 
     public const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
     public const uint FILE_ATTRIBUTE_READONLY = 0x00000001;
+    /// <summary>重定向点（Junction / Symbolic Link / Mount Point）。物理边界守卫用它判断"这段路径是不是绕出去了"。</summary>
+    public const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
     public const uint INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
+
+    /// <summary>
+    /// 取一个已打开句柄对应的**最终物理路径**（已解析 Junction / 符号链接）。
+    /// 返回的字符串带 <c>\\?\</c> 前缀（UNC 是 <c>\\?\UNC\</c>），调用方需要自行规范化。
+    /// </summary>
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern uint GetFinalPathNameByHandleW(
+        IntPtr hFile,
+        [Out] char[] lpszFilePath,
+        uint cchFilePath,
+        uint dwFlags);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern IntPtr FindFirstFileW(string lpFileName, out WIN32_FIND_DATA lpFindFileData);

@@ -310,6 +310,30 @@ public sealed class RestoreEngine
         bool allowNewRemovals,
         Action<string>? log = null)
     {
+        // ── P0-2：恢复事务串行闸 ──
+        // 恢复会暂停监听、建安全点、逐个改写磁盘、再重新对齐索引；两个恢复同时跑会互相踩
+        // （各自的执行基线、安全点、索引重对齐全部错位）。闸门覆盖**整个**执行过程，
+        // 不是只锁某一步、也不是只锁界面或数据库。
+        // 语义非阻塞：已经在跑就直接拒绝，不让用户白等。
+        using var lease = RestoreExecutionGate.TryEnter();
+        if (lease is null)
+        {
+            return Fail(0,
+                "当前已有另一个恢复操作正在执行。为避免两个恢复同时修改文件，本次操作已拒绝；" +
+                "请等待前一个恢复结束后重新预览。",
+                rejected: true);
+        }
+
+        return ExecuteCore(plan, confirmFingerprint, allowNewRemovals, log);
+    }
+
+    /// <summary>恢复的实际执行体；进入这里时**已经持有恢复事务闸**，退出时由调用方释放。</summary>
+    private RestoreOutcome ExecuteCore(
+        RestorePlan plan,
+        string confirmFingerprint,
+        bool allowNewRemovals,
+        Action<string>? log)
+    {
         var root = _roots.Get(plan.RootId);
         if (root is null) return Fail(0, "受保护范围不存在。");
 
@@ -358,6 +382,17 @@ public sealed class RestoreEngine
             return Fail(0, staleReason, rejected: true);
         }
 
+        // ── P0-1：物理边界预检（必须在建安全点与恢复记录**之前**）──
+        // PathUtil 只能证明"字符串路径仍位于 root 之下"；Junction / 符号链接能让真实落点
+        // 跑到 root 之外。任何一条会写磁盘的步骤证明不了边界，就整体拒绝：
+        // 不建安全点、不写恢复记录、不碰磁盘。
+        var boundaryReason = ValidatePhysicalBoundary(root, plan);
+        if (boundaryReason is not null)
+        {
+            log?.Invoke(boundaryReason);
+            return Fail(0, boundaryReason, rejected: true);
+        }
+
         // ── 规则 2：执行前必须有一个完整的安全点 ──
         log?.Invoke("正在创建恢复前安全点（记录当前完整状态与内容）…");
         var safety = CreateSafetySnapshot(root, plan, log);
@@ -387,7 +422,9 @@ public sealed class RestoreEngine
         int succeeded = 0, failed = 0, skipped = 0;
         var failures = new List<string>();
         bool watcherWasRunning = _watch.GetState(root.Id).Watching;
-        _executionBaseline = plan.Current;
+        // 执行基线不再放进实例字段（P0-2）：它曾经是共享可变状态，
+        // 两个恢复并发时会互相覆盖。现在按参数一路传下去。
+        var executionBaseline = plan.Current;
 
         try
         {
@@ -421,7 +458,7 @@ public sealed class RestoreEngine
             var earlyRemovals = plan.Steps.Where(NeedsEarlyRemove).ToList();
             foreach (var step in earlyRemovals)
             {
-                Tally(ExecuteStep(root, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
+                Tally(ExecuteStep(root, executionBaseline, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
             }
             if (earlyRemovals.Count > 0)
             {
@@ -433,23 +470,23 @@ public sealed class RestoreEngine
             // 顺序很重要：先保证目录存在再写文件；先写回再删除（避免中间态把用户数据置于风险中）。
             foreach (var step in plan.Steps.Where(s => s.Action == RestoreAction.CreateDirectory))
             {
-                Tally(ExecuteStep(root, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
+                Tally(ExecuteStep(root, executionBaseline, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
             }
 
             foreach (var step in plan.Steps.Where(s => s.Action == RestoreAction.RestoreContent))
             {
-                Tally(ExecuteStep(root, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
+                Tally(ExecuteStep(root, executionBaseline, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
             }
 
             foreach (var step in plan.Steps.Where(s => s.Action == RestoreAction.RemovePath && !earlySet.Contains(s)))
             {
-                Tally(ExecuteStep(root, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
+                Tally(ExecuteStep(root, executionBaseline, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
             }
 
             // 最后尝试清理空目录（非空目录一律保留并如实报告）
             foreach (var step in plan.Steps.Where(s => s.Action == RestoreAction.RemoveDirectory && !earlySet.Contains(s)))
             {
-                Tally(ExecuteStep(root, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
+                Tally(ExecuteStep(root, executionBaseline, step, operation.Id, indexOf[step]), bySeq, ref succeeded, ref failed, ref skipped, failures, log);
             }
 
             // 把每一步的执行结果落库（崩溃后据此判断实际做到了哪一步）
@@ -607,7 +644,12 @@ public sealed class RestoreEngine
         public string? Message { get; init; }
     }
 
-    private StepResult ExecuteStep(WatchedRoot root, RestoreStep step, long operationId, int sequence)
+    private StepResult ExecuteStep(
+        WatchedRoot root,
+        FileTreeManifest executionBaseline,
+        RestoreStep step,
+        long operationId,
+        int sequence)
     {
         var record = new RestoreStepRecord
         {
@@ -625,13 +667,26 @@ public sealed class RestoreEngine
         //    "刚改过的文件被认为没改过"，从而**静默覆盖用户的新内容**——这是最危险的失败方式；
         //  · plan.Current 是用户在预览里逐条看过的状态，语义上正是"我看到的那一版"。
         // 只有"预览之后又被改动"才会不一致，从而触发跳过。文件已不存在时回退到索引值。
-        var baseline = _executionBaseline?.Find(step.RelativePath)?.Hash
+        // 执行基线现在由调用方按参数传入（plan.Current），不再读实例字段：
+        // 那个字段是共享可变状态，两个恢复并发时会互相覆盖（P0-2）。
+        // 注意：**不再写回 step.ExpectedCurrentHash** —— RestoreStep 属于用户确认过的 Plan，
+        // 执行过程不应该回头修改它的确认字段；冲突检测直接用下面这个局部变量。
+        var baseline = executionBaseline.Find(step.RelativePath)?.Hash
+                       ?? step.ExpectedCurrentHash
                        ?? _index.Get(root.Id, step.RelativePath)?.Hash;
-        step.ExpectedCurrentHash = baseline;
 
         try
         {
-            var absolute = PathUtil.ToAbsolute(root.Path, step.RelativePath);
+            // ── P0-1 第二道防线：紧贴破坏动作之前再验一次物理边界 ──
+            // 只在预检里挡是不够的：预览/预检时这里还是普通目录，
+            // 用户确认之后目录可能被换成 Junction，中间存在窗口。
+            // 所以每个真正会动磁盘的步骤都要重新证明一次；证明不了就明确失败，绝不碰磁盘。
+            if (!PhysicalPathGuard.TryValidateMutationTarget(
+                    root.Path, step.RelativePath, out var absolute, out var guardError))
+            {
+                record.Error = guardError ?? "无法确认该路径仍位于受保护范围内，已跳过该步骤";
+                return new StepResult { Success = false, Error = record.Error, Record = record };
+            }
 
             switch (step.Action)
             {
@@ -780,6 +835,42 @@ public sealed class RestoreEngine
     };
 
     /// <summary>
+    /// P0-1：物理边界预检。
+    ///
+    /// 遍历本次**真正会写磁盘**的四类步骤（建目录 / 删目录 / 删路径 / 写回内容），
+    /// 逐条要求 PhysicalPathGuard 能证明"目标仍物理地位于受保护范围之内"。
+    /// 只要有一条证明不了就整体拒绝 —— 不去猜哪一条"看起来没问题"。
+    /// </summary>
+    private static string? ValidatePhysicalBoundary(WatchedRoot root, RestorePlan plan)
+    {
+        const int maxReported = 5;
+        var offenders = new List<string>();
+
+        foreach (var step in plan.Steps)
+        {
+            if (step.Action is not (RestoreAction.CreateDirectory
+                                    or RestoreAction.RemoveDirectory
+                                    or RestoreAction.RemovePath
+                                    or RestoreAction.RestoreContent))
+            {
+                continue;
+            }
+            if (string.IsNullOrEmpty(step.RelativePath)) continue;
+
+            if (!PhysicalPathGuard.TryValidateMutationTarget(root.Path, step.RelativePath, out _, out var error))
+            {
+                offenders.Add($"{step.RelativePath}（{error}）");
+                if (offenders.Count >= maxReported) break;
+            }
+        }
+
+        if (offenders.Count == 0) return null;
+
+        return "恢复计划包含无法证明仍位于受保护范围内的路径，已拒绝执行：" +
+               string.Join("；", offenders);
+    }
+
+    /// <summary>
     /// 计划是否已经过期（预览之后磁盘上的内容又被改动过）。
     ///
     /// 只看"本次会覆盖或删除、且预览时确实存在"的文件：把磁盘上现在的内容与
@@ -841,7 +932,6 @@ public sealed class RestoreEngine
     /// 本次执行使用的"当前状态清单"（即用户在预览里看到的那一版）。
     /// 冲突检测以它为基线：只有"预览之后确实又被改过"的文件才会不一致。
     /// </summary>
-    private FileTreeManifest? _executionBaseline;
 
     private static List<RestoreStepRecord> BuildStepRecords(long operationId, RestorePlan plan) =>
         plan.Steps.Select((s, i) => new RestoreStepRecord

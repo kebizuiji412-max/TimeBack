@@ -109,13 +109,30 @@ internal sealed class WatchEventPipeline
             var beforeResult = _contentWriter.Store(c.Before, c.RelativePath, maxSize);
             var afterResult = _contentWriter.Store(c.After, c.RelativePath, maxSize);
 
+            // ⚠ P1-1 修复：删除事件的 Kind 不能直接用 raw.IsDirectory。
+            //   DirectoryWatcher 收到 FILE_ACTION_REMOVED 时目标多半已经消失，
+            //   Directory.Exists 返回 false → raw.IsDirectory = false，于是"删掉一个真实目录"
+            //   被记成 File；下游据此走 MarkDeleted(parent) 而不是 MarkSubtreeDeleted(parent)，
+            //   会留下读不到的幽灵子项。
+            //   删除之后磁盘已不可依赖，**旧索引才是正确的事实来源**，
+            //   raw.IsDirectory 只作"没有旧索引"时的 fallback。
+            var effectiveKind = c.Kind;
+            if (c.Operation == OperationType.Deleted)
+            {
+                var previous = _index.Get(c.RootId, c.RelativePath);
+                if (previous is { IsDeleted: false })
+                {
+                    effectiveKind = previous.Kind;
+                }
+            }
+
             var ev = new FileEvent
             {
                 RootId = c.RootId,
                 TimestampUtc = c.FirstUtc,
                 TimestampLocal = c.FirstUtc.ToLocalTime(),
                 Operation = c.Operation,
-                Kind = c.Kind,
+                Kind = effectiveKind,
                 RelativePath = c.RelativePath,
                 OldRelativePath = c.OldRelativePath,
                 SizeBefore = c.Before?.Size ?? beforeResult.Size,

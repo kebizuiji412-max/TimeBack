@@ -41,6 +41,7 @@ public static class Program
         cases.AddRange(WatchSplitSuites.All());
         cases.AddRange(AgentCliSuites.All());
         cases.AddRange(ReliabilitySuites.All());
+        cases.AddRange(SafetyHotfixSuites.All());
 
 
         if (!string.IsNullOrWhiteSpace(filter))

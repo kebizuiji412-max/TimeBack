@@ -298,6 +298,27 @@ public sealed class FileSystemReader : IFileContentReader
                         continue;
                     }
 
+                    // ★ 安全策略（P0-1）：重定向目录**不进入保护树**。
+                    //   Junction / Symbolic Link 可能指向 root 之外（D:\Protected\Link → D:\Outside），
+                    //   递归进去等于把保护范围外的东西扫进索引与快照清单。
+                    //   这是主动跳过，不算 ScanError。
+                    try
+                    {
+                        var subAttributes = File.GetAttributes(Extend(sub));
+                        if ((subAttributes & FileAttributes.ReparsePoint) != 0)
+                        {
+                            stats.SkippedCount++;
+                            continue;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // 读不到属性就不递归：宁可少保护，也不越界保护。
+                        stats.SkippedCount++;
+                        if (stats.Errors.Count < 100) stats.Errors.Add($"{sub} → {Describe(ex)}");
+                        continue;
+                    }
+
                     DateTime? mtime = null;
                     bool readOnly = false;
                     try
@@ -329,6 +350,25 @@ public sealed class FileSystemReader : IFileContentReader
                     if (exclusions.Check(rel).Excluded)
                     {
                         stats.SkippedCount++;
+                        continue;
+                    }
+
+                    // ★ 安全策略（P0-1）：文件型重定向点同样**不读取内容、不进清单**。
+                    //   文件符号链接可能指向 root 之外，不能让内容库去读保护范围外的正文。
+                    //   同样是主动跳过，不算 ScanError。
+                    try
+                    {
+                        var fileAttributes = File.GetAttributes(Extend(file));
+                        if ((fileAttributes & FileAttributes.ReparsePoint) != 0)
+                        {
+                            stats.SkippedCount++;
+                            continue;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        stats.SkippedCount++;
+                        if (stats.Errors.Count < 100) stats.Errors.Add($"{file} → {Describe(ex)}");
                         continue;
                     }
 
