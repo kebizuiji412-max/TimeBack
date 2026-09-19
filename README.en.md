@@ -14,7 +14,7 @@
 |---|---|
 | Stage | **Phases 1–5 complete**, plus first-run onboarding rework, repositioning as a small Windows tool, a mini file browser with custom restore/delete, and configurable history cleanup and storage location |
 | Build | Offline build passes (zero NuGet dependencies) |
-| Tests | **189 / 189 passing**, including real-filesystem end-to-end runs, time-display/time-zone consistency, cross-timestamp custom restores, custom deletion, protection-range removal, whole-directory restores, and pre-release permission/scope/privacy cases |
+| Tests | **197 / 197 passing**, including real-filesystem end-to-end runs, time-display/time-zone consistency, cross-timestamp custom restores, custom deletion, protection-range removal, whole-directory restores, pre-release permission/scope/privacy cases, and the v0.2.1 safety hotfix cases for physical boundaries and serialized restores |
 | Code health | One complexity/duplication/dead-code audit completed, followed by surgical cleanup: `MainViewModel` went from 3402 lines down to **3102 lines** (about −9%), with the tests untouched |
 | Architecture | A separate **`LastRegret.Runtime`** library (composition root) with **zero WPF dependency**; an **experimental Agent CLI** now sits on top of it (`code/src/LastRegret.Agent`, protocol `timeback-agent 1.0`) — the GUI does not depend on it, and it is not part of the release package |
 | Pre-release review | Completed: 2 blocking findings and 3 high-risk findings were all fixed; a re-scan found no blockers |

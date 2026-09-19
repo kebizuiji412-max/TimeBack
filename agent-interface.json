@@ -14,7 +14,7 @@
   "product": {
     "id": "timeback",
     "name": "回溯 / TimeBack",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "platform": "windows"
   },
 

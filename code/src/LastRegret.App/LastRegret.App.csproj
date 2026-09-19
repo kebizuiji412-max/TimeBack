@@ -11,7 +11,7 @@
     <Product>回溯 (TimeBack)</Product>
     <AssemblyTitle>回溯</AssemblyTitle>
     <Description>回溯 (TimeBack) —— Windows 本机文件状态时间机器：记录文件夹历史，可把文件恢复到过去的状态。</Description>
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
     <!-- 应用图标：由 assets/icon/make-icon.ps1 生成（多尺寸 ico，内嵌 256/128/64/48/32/24/16） -->
     <ApplicationIcon>app.ico</ApplicationIcon>
     <Platforms>AnyCPU;x64</Platforms>
